@@ -48,7 +48,7 @@ try {
   } else if (command === 'approve-task') {
     const id = args[0];
     if (!id || !library.approveProjectTask(id)) throw new Error('Project task is not waiting for approval or the ID is ambiguous.');
-    process.stdout.write(`Read-only project task ${id} approved and queued.\n`);
+    process.stdout.write(`Project task ${id} approved and queued with write access limited to its registered project directory.\n`);
   } else if (command === 'outbound-test') {
     const id = library.createOutboundTest();
     process.stdout.write(`Queued one harmless outbound test (${id.slice(0, 8)}). It sends only if the extension is open on the configured self-chat.\n`);
@@ -65,7 +65,7 @@ try {
     const dataDir = await realpath(DATA_DIR).catch(() => resolve(DATA_DIR));
     if (canonical === dataDir || canonical.startsWith(`${dataDir}/`)) throw new Error('Gateway data storage cannot be registered as a project.');
     library.addProject(alias, canonical);
-    process.stdout.write(`Registered ${alias} for read-only Codex access.\n`);
+    process.stdout.write(`Registered ${alias}. Each project task needs explicit approval before Codex can write inside that directory.\n`);
   } else if (command === 'project' && args[0] === 'list') {
     process.stdout.write(JSON.stringify(library.listProjects(), null, 2) + '\n');
   } else if (command === 'projects') {

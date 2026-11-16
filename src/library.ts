@@ -292,9 +292,11 @@ export class KnowledgeLibrary {
           itemIds.push(activeId);
           kind = 'task';
           taskId = this.createTask(message.messageKey, message.text, receivedAt, activeId, this.findContinuationTarget(message.text, receivedAt));
+          this.queueProjectApprovalNotice(taskId, receivedAt);
         } else if (message.text.trim()) {
           kind = 'task';
           taskId = this.createTask(message.messageKey, message.text, receivedAt, null, this.findContinuationTarget(message.text, receivedAt));
+          this.queueProjectApprovalNotice(taskId, receivedAt);
         }
       }
 
@@ -350,7 +352,10 @@ export class KnowledgeLibrary {
       else {
         const followup = args.slice(1).join(' ');
         const id = this.createTask(sourceKey, followup, at, null, previous.id);
-        this.queueOutbox(id, `Continuing task ${previous.id.slice(0, 8)}. New task ${id.slice(0, 8)} queued.`, at);
+        const created = this.getTask(id);
+        this.queueOutbox(id, created?.intent.startsWith('project:')
+          ? `Project continuation ${id.slice(0, 8)} is awaiting explicit local approval. Review it with npm run gateway:inbox.`
+          : `Continuing task ${previous.id.slice(0, 8)}. New task ${id.slice(0, 8)} queued.`, at);
       }
       return true;
     }
@@ -361,7 +366,6 @@ export class KnowledgeLibrary {
       else {
         const request = args.slice(1).join(' ');
         const id = this.createTask(sourceKey, request, at, null, undefined, alias);
-        this.db.prepare("UPDATE gateway_tasks SET status='waiting_approval' WHERE id=?").run(id);
         this.queueOutbox(id, `Project task ${id.slice(0, 8)} is awaiting explicit local approval before it starts. Review with npm run gateway:inbox.`, at);
       }
       return true;
@@ -383,12 +387,27 @@ export class KnowledgeLibrary {
   private createTask(sourceKey: string, text: string, at = new Date().toISOString(), sourceItemId: string | null = null, continuationOf?: string, projectAlias?: string): string {
     const id = randomUUID();
     const requestText = continuationOf ? `Continue task ${continuationOf}. Prior context: continue the same investigation and use the earlier findings.\n\nFollow-up: ${text}` : text;
-    const intent = projectAlias ? `project:${projectAlias}` : /https?:\/\/github\.com\//i.test(text) ? 'repository' : /https?:\/\//i.test(text) || /\b(research|investigate|compare|pricing|technical report|source attribution)\b/i.test(text) ? 'research' : 'general';
+    const inheritedProject = projectAlias ? null : continuationOf
+      ? this.db.prepare('SELECT project_alias AS projectAlias FROM gateway_tasks WHERE id=?').get(continuationOf) as { projectAlias: string | null } | undefined
+      : undefined;
+    const scopedProjectAlias = projectAlias ?? inheritedProject?.projectAlias ?? undefined;
+    const intent = scopedProjectAlias ? `project:${scopedProjectAlias}` : /https?:\/\/github\.com\//i.test(text) ? 'repository' : /https?:\/\//i.test(text) || /\b(research|investigate|compare|pricing|technical report|source attribution)\b/i.test(text) ? 'research' : 'general';
     const priorThread = continuationOf ? this.getTask(continuationOf)?.threadId ?? null : null;
     this.db.prepare(`INSERT INTO gateway_tasks(id,source_message_key,request_text,intent,status,source_item_id,continuation_of,project_alias,thread_id,created_at,updated_at)
-      VALUES(?,?,?,?, 'queued',?,?,?,?,?,?)`).run(id, sourceKey, requestText, intent, sourceItemId, continuationOf ?? null, projectAlias ?? null, priorThread, at, at);
-    this.db.prepare('INSERT INTO gateway_task_events(task_id,event_kind,content,created_at) VALUES(?,?,?,?)').run(id, 'queued', 'Accepted from the configured WhatsApp self-chat.', at);
+      VALUES(?,?,?,?, ?,?,?,?,?,?,?)`).run(id, sourceKey, requestText, intent, scopedProjectAlias ? 'waiting_approval' : 'queued', sourceItemId, continuationOf ?? null, scopedProjectAlias ?? null, priorThread, at, at);
+    if (scopedProjectAlias) {
+      this.db.prepare('INSERT INTO gateway_task_events(task_id,event_kind,content,created_at) VALUES(?,?,?,?)').run(id, 'approval_required', 'Project access requires explicit approval for this task.', at);
+    } else {
+      this.db.prepare('INSERT INTO gateway_task_events(task_id,event_kind,content,created_at) VALUES(?,?,?,?)').run(id, 'queued', 'Accepted from the configured WhatsApp self-chat.', at);
+    }
     return id;
+  }
+
+  private queueProjectApprovalNotice(taskId: string, at: string): void {
+    const task = this.getTask(taskId);
+    if (task?.intent.startsWith('project:')) {
+      this.queueOutbox(taskId, `Project continuation ${taskId.slice(0, 8)} is awaiting explicit approval before Codex can continue. Review it with npm run gateway:inbox.`, at);
+    }
   }
 
   private findContinuationTarget(text: string, at: string): string | undefined {
@@ -460,7 +479,8 @@ export class KnowledgeLibrary {
   markInterrupted(): void {
     const at = new Date().toISOString();
     this.db.prepare("UPDATE gateway_tasks SET status='needs_resume',updated_at=? WHERE status='running'").run(at);
-    this.db.prepare("UPDATE gateway_tasks SET status='needs_resume',updated_at=? WHERE status='waiting_approval'").run(at);
+    this.db.prepare(`UPDATE gateway_tasks SET status='needs_resume',updated_at=? WHERE status='waiting_approval' AND
+      (intent NOT LIKE 'project:%' OR EXISTS (SELECT 1 FROM gateway_approvals a WHERE a.task_id=gateway_tasks.id AND a.state='pending'))`).run(at);
     this.db.prepare("UPDATE gateway_approvals SET state='expired',resolved_at=? WHERE state='pending'").run(at);
     this.db.prepare("UPDATE gateway_outbox SET delivery_state='failed' WHERE delivery_state='sending'").run();
   }
@@ -546,8 +566,11 @@ export class KnowledgeLibrary {
     const task = this.getTask(idPrefix);
     if (!task || task.status !== 'waiting_approval' || !task.intent.startsWith('project:')) return false;
     this.db.prepare("UPDATE gateway_tasks SET status='queued',updated_at=? WHERE id=?").run(new Date().toISOString(), task.id);
-    this.appendTaskEvent(task.id, 'project_approved', 'User explicitly approved read-only access to the registered project.');
+    this.appendTaskEvent(task.id, 'project_approved', 'User explicitly approved this task for read-write access scoped to the registered project directory.');
     return true;
+  }
+  isProjectTaskApproved(id: string): boolean {
+    return Boolean(this.db.prepare("SELECT 1 FROM gateway_task_events WHERE task_id=? AND event_kind='project_approved' LIMIT 1").get(id));
   }
   resumeTask(idPrefix: string): boolean {
     const task = this.getTask(idPrefix);

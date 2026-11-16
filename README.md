@@ -8,7 +8,7 @@ The Chrome extension observes only newly visible messages while the exact config
 
 Instagram Reel links continue to enter the Reel library. Other links and standalone text become durable Codex tasks instead of being discarded. Codex runs through the installed `codex app-server` using the local ChatGPT/Codex sign-in. Tasks use persistent App Server threads; a clear recent follow-up continues the one matching thread, while `/continue <task-id> ...` targets a thread directly.
 
-Research and project inspection use Codex's read-only sandbox. The configured local project aliases are also read-only. Codex permission requests remain pending until you explicitly approve or deny them. No permission request is auto-approved.
+General research uses Codex's read-only sandbox. A registered project task waits for your explicit approval before Codex gets write access limited to that project's directory; project tasks have no network access. Codex permission requests remain pending until you explicitly approve or deny them. No permission request is auto-approved.
 
 The gateway disables configured local MCP servers other than its read-only `reel-to-codex` knowledge server, and disables installed Codex plugins for each turn. The installed App Server also exposes a host-provided CUA MCP whose transport rejects a per-process disable override. Gateway instructions prohibit computer-control and browser-automation calls; for a hard tool boundary, disable that CUA MCP in Codex before starting the gateway.
 
@@ -70,7 +70,7 @@ npm run gateway:ctl -- project add demo "$PWD"
 npm run gateway:ctl -- project list
 ```
 
-A `/project` task waits until you explicitly approve its task ID. The project remains read-only. Codex approval codes and task state can also be reviewed in `npm run gateway:inbox`; the local CLI supports `approve <code>`, `deny <code>`, and `approve-task <task-id>`.
+A `/project` task waits until you explicitly approve its task ID. Approval allows Codex to make requested changes only inside that registered project directory. Project tasks cannot access the network, install software, change global settings, commit or push, or publish externally. Each continuation of a project task also requires approval. Codex approval codes and task state can be reviewed in `npm run gateway:inbox`; the local CLI supports `approve <code>`, `deny <code>`, and `approve-task <task-id>`.
 
 ## WhatsApp replies
 
@@ -116,7 +116,7 @@ The schema upgrades transactionally and keeps existing Reel, instruction, and fi
 - Chrome must be open, WhatsApp Web logged in, and the exact self-chat selected. Selecting another chat pauses observation before the message container is queried.
 - Earlier chat history is not imported. If the visible cursor disappears, collection pauses until rebaseline.
 - Website, Reel, and repository content are untrusted input. The gateway wraps source text as untrusted and never treats it as trusted system instructions.
-- No files are edited and no software is installed by gateway tasks. Project aliases are read-only. Consequential actions require a separate supported Codex approval and remain blocked until you decide.
+- General gateway tasks do not edit files. An explicitly approved project task may edit files only inside its registered project directory; network access and software installation are disabled for that task. Consequential App Server permission requests remain blocked until you decide.
 - A gateway task is a separate Codex App Server thread; it does not take over an arbitrary conversation already open in Codex Desktop.
 - Codex authentication and usage limits follow the locally signed-in Codex account. This project does not require a separate paid API key.
 - The read-only sandbox protects local files; it does not constrain arbitrary actions exposed by MCP tools. Keep the CUA MCP disabled in Codex if you need a strict no-computer-control boundary.

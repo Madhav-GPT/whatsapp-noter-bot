@@ -130,10 +130,23 @@ test('gateway controls require explicit approval and projects are queued only af
   const projectTask = library.ingest({ chatTitle: SELF_CHAT_TITLE, messageKey: messageKey('project-task'), text: '/project demo summarize the repository' });
   assert.equal(projectTask.kind, 'command');
   assert.equal(library.getTask(projectTask.taskId!)?.status, 'waiting_approval');
+  assert.equal(library.isProjectTaskApproved(projectTask.taskId!), false);
+  library.markInterrupted();
+  assert.equal(library.getTask(projectTask.taskId!)?.status, 'waiting_approval', 'unapproved project tasks must remain available for approval after restart');
   assert.equal(library.approveProjectTask(projectTask.taskId!.slice(0, 8)), true);
   assert.equal(library.getTask(projectTask.taskId!)?.status, 'queued');
+  assert.equal(library.isProjectTaskApproved(projectTask.taskId!), true);
+  library.setTaskThread(projectTask.taskId!, 'thread-project');
+  library.finishTask(projectTask.taskId!, 'completed', 'Repository summary');
 
-  const code = library.createApproval(projectTask.taskId!, 'server-request-1', 'item/fileChange/requestApproval', { reason: 'write files' });
+  const continuation = library.ingest({ chatTitle: SELF_CHAT_TITLE, messageKey: messageKey('project-followup'), text: `/continue ${projectTask.taskId!.slice(0, 8)} update the project` });
+  assert.equal(library.getTask(continuation.taskId!)?.status, 'waiting_approval');
+  assert.equal(library.getTask(continuation.taskId!)?.threadId, 'thread-project');
+  assert.equal(library.getTask(continuation.taskId!)?.intent, 'project:demo');
+  assert.equal(library.isProjectTaskApproved(continuation.taskId!), false);
+  assert.equal(library.approveProjectTask(continuation.taskId!.slice(0, 8)), true);
+
+  const code = library.createApproval(continuation.taskId!, 'server-request-1', 'item/fileChange/requestApproval', { reason: 'write files' });
   assert.equal(library.pendingApprovals().length, 1);
   assert.equal(library.resolveApproval(code, true), true);
   assert.equal(library.pendingApprovals().length, 0);
