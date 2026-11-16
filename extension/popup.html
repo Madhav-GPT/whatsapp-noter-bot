@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Reel to Codex</title>
+    <style>
+      body { width: 300px; margin: 0; padding: 16px; color: #1e2420; background: #f7f8f4; font: 14px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+      h1 { margin: 0 0 8px; font-size: 16px; }
+      p { margin: 0 0 12px; color: #505a53; }
+      button { width: 100%; border: 0; border-radius: 8px; padding: 10px; background: #135d43; color: white; font: inherit; cursor: pointer; }
+      button:disabled { opacity: .55; cursor: default; }
+      #result { margin-top: 10px; font-size: 12px; }
+      .muted { color: #657068; }
+    </style>
+  </head>
+  <body>
+    <h1>Reel to Codex</h1>
+    <p id="status" class="muted">Checking local collector…</p>
+    <button id="rebaseline" type="button">Rebaseline this self-chat</button>
+    <div id="result" class="muted">Rebaseline skips messages through the latest visible message.</div>
+    <script src="popup.js"></script>
+  </body>
+</html>

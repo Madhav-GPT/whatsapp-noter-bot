@@ -1,0 +1,28 @@
+{
+  "name": "whatsapp-noter-bot",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Local-first Instagram Reel inbox for WhatsApp Web Message Yourself and MCP",
+  "scripts": {
+    "setup": "tsx src/setup.ts",
+    "collector": "tsx src/collector.ts",
+    "mcp": "tsx src/mcp.ts",
+    "status": "tsx src/status.ts",
+    "db:check": "tsx src/db-check.ts",
+    "test": "tsx --test test/*.test.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@modelcontextprotocol/client": "2.4.0",
+    "@types/better-sqlite3": "9.6.0",
+    "@types/node": "22.19.0",
+    "tsx": "4.20.3",
+    "typescript": "7.0.2"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/server": "2.4.0",
+    "better-sqlite3": "13.2.0",
+    "zod": "4.6.7"
+  }
+}
