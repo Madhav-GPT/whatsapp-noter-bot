@@ -6,6 +6,7 @@ export const DATA_DIR = process.env.REEL_TO_CODEX_DATA_DIR ?? join(homedir(), 'L
 export const DATABASE_PATH = process.env.REEL_TO_CODEX_DATABASE ?? join(DATA_DIR, 'knowledge.sqlite');
 export const TOKEN_PATH = join(DATA_DIR, 'collector-token');
 export const SETTINGS_PATH = join(DATA_DIR, 'settings.json');
+export const EXTENSION_ID = 'bigaphijjgaoaddakapcaebjfgbfmcnd';
 
 function loadSelfChatTitle(): string {
   const override = process.env.REEL_TO_CODEX_SELF_CHAT_TITLE;

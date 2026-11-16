@@ -31,5 +31,11 @@ export function createMcpServer(library: KnowledgeLibrary): McpServer {
   register(server, 'get_item_instructions', 'Get the exact follow-up instructions saved for one Reel.', z.object({ id: z.string().min(1).max(100) }), ({ id }) => library.getInstructions(String(id)));
   register(server, 'get_skill_candidates', 'List proposed skill candidates with their attribution and review requirements.', z.object({ itemId: z.string().min(1).max(100).optional() }), ({ itemId }) => library.getSkillCandidates(typeof itemId === 'string' ? itemId : undefined));
   register(server, 'get_collector_status', 'Read local collector health and the most recent verified self-chat poll time.', z.object({}), () => library.getCollectorStatus());
+  register(server, 'list_gateway_tasks', 'List recent Codex gateway tasks and their durable statuses.', z.object({
+    limit: z.number().int().min(1).max(100).optional(),
+    status: z.enum(['queued','running','waiting_approval','completed','failed','cancelled','needs_resume']).optional(),
+  }), ({ limit, status }) => library.listTasks(Number(limit ?? 20), typeof status === 'string' ? status : undefined));
+  register(server, 'get_gateway_task', 'Read one gateway task, its saved result, events, and approval history.', z.object({ id: z.string().min(1).max(100) }), ({ id }) => library.getTaskDetails(String(id)) ?? { error: 'not_found_or_ambiguous' });
+  register(server, 'search_gateway_tasks', 'Search completed gateway task requests and saved research reports.', z.object({ query: z.string().min(1).max(500), limit: z.number().int().min(1).max(50).optional() }), ({ query, limit }) => library.searchTasks(String(query), Number(limit ?? 10)));
   return server;
 }

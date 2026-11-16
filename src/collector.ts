@@ -1,6 +1,6 @@
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import { readFile } from 'node:fs/promises';
-import { TOKEN_PATH, SELF_CHAT_TITLE } from './paths.js';
+import { TOKEN_PATH, SELF_CHAT_TITLE, EXTENSION_ID } from './paths.js';
 import { openLibrary } from './library.js';
 
 const PORT = Number(process.env.REEL_TO_CODEX_PORT ?? 8787);
@@ -19,7 +19,7 @@ if (!/^[A-Za-z0-9_-]{40,}$/.test(token)) {
 }
 
 function send(res: ServerResponse, status: number, value: unknown, origin?: string): void {
-  if (origin?.startsWith('chrome-extension://')) {
+  if (origin === `chrome-extension://${EXTENSION_ID}`) {
     res.setHeader('Access-Control-Allow-Origin', origin);
     res.setHeader('Vary', 'Origin');
   }
@@ -29,7 +29,7 @@ function send(res: ServerResponse, status: number, value: unknown, origin?: stri
 
 function validExtensionOrigin(req: IncomingMessage): boolean {
   const origin = req.headers.origin;
-  return origin === undefined || origin.startsWith('chrome-extension://');
+  return origin === undefined || origin === `chrome-extension://${EXTENSION_ID}`;
 }
 
 function authorized(req: IncomingMessage): boolean {
@@ -58,7 +58,7 @@ const server = createServer(async (req, res) => {
     return;
   }
   if (req.method === 'OPTIONS' && req.url?.startsWith('/v1/')) {
-    if (!origin?.startsWith('chrome-extension://')) {
+    if (origin !== `chrome-extension://${EXTENSION_ID}`) {
       send(res, 403, { error: 'forbidden_origin' });
       return;
     }
@@ -86,6 +86,19 @@ const server = createServer(async (req, res) => {
     if (req.method === 'GET' && req.url === '/v1/state') {
       const state = library.getState();
       send(res, 200, state, origin);
+      return;
+    }
+    if (req.method === 'GET' && req.url?.startsWith('/v1/tasks')) {
+      const url = new URL(req.url, `http://127.0.0.1:${PORT}`);
+      const limit = Number(url.searchParams.get('limit') ?? 20);
+      const status = url.searchParams.get('status') ?? undefined;
+      send(res, 200, { tasks: library.listTasks(limit, status) }, origin);
+      return;
+    }
+    if (req.method === 'GET' && req.url?.startsWith('/v1/outbox')) {
+      const url = new URL(req.url, `http://127.0.0.1:${PORT}`);
+      const limit = Number(url.searchParams.get('limit') ?? 50);
+      send(res, 200, { items: library.getOutbox(limit) }, origin);
       return;
     }
     if (req.method === 'POST' && req.url === '/v1/heartbeat') {
@@ -121,6 +134,36 @@ const server = createServer(async (req, res) => {
         ...(typeof body.observedAt === 'string' ? { observedAt: body.observedAt } : {}),
       });
       send(res, 200, { ok: true, ...result }, origin);
+      return;
+    }
+    if (req.method === 'POST' && req.url === '/v1/outbox/claim') {
+      const body = await readJson(req);
+      if (body.chatTitle !== SELF_CHAT_TITLE) {
+        send(res, 400, { error: 'invalid_outbound_request' }, origin);
+        return;
+      }
+      const item = library.claimNextOutbound(SELF_CHAT_TITLE);
+      send(res, 200, { ok: true, item }, origin);
+      return;
+    }
+    if (req.method === 'POST' && req.url === '/v1/outbox/sent') {
+      const body = await readJson(req);
+      if (body.chatTitle !== SELF_CHAT_TITLE || typeof body.outboxId !== 'string' || typeof body.messageKey !== 'string') {
+        send(res, 400, { error: 'invalid_outbound_result' }, origin);
+        return;
+      }
+      library.markOutboundSent(body.outboxId, body.messageKey);
+      send(res, 200, { ok: true }, origin);
+      return;
+    }
+    if (req.method === 'POST' && req.url === '/v1/outbox/failed') {
+      const body = await readJson(req);
+      if (body.chatTitle !== SELF_CHAT_TITLE || typeof body.outboxId !== 'string') {
+        send(res, 400, { error: 'invalid_outbound_result' }, origin);
+        return;
+      }
+      library.markOutboundFailed(body.outboxId);
+      send(res, 200, { ok: true }, origin);
       return;
     }
     if (req.method === 'POST' && req.url === '/v1/cursor-gap') {

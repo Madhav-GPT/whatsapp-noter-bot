@@ -6,6 +6,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createServer } from 'node:net';
 import { spawn } from 'node:child_process';
+import { EXTENSION_ID } from '../src/paths.js';
 
 async function freePort(): Promise<number> {
   const server = createServer();
@@ -47,13 +48,13 @@ test('loopback collector requires its token and accepts only the configured self
     }
     assert.equal(ready, true, `Collector did not start: ${output}`);
 
-    const forbiddenOrigin = await fetch(`${base}/v1/state`, { headers: { Origin: 'https://untrusted.example' } });
+    const forbiddenOrigin = await fetch(`${base}/v1/state`, { headers: { Origin: 'chrome-extension://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' } });
     assert.equal(forbiddenOrigin.status, 403);
-    const missingToken = await fetch(`${base}/v1/state`, { headers: { Origin: 'chrome-extension://test' } });
+    const missingToken = await fetch(`${base}/v1/state`, { headers: { Origin: `chrome-extension://${EXTENSION_ID}` } });
     assert.equal(missingToken.status, 401);
 
     const otherChat = await fetch(`${base}/v1/events`, {
-      method: 'POST', headers: { ...auth, Origin: 'chrome-extension://test', 'Content-Type': 'application/json' },
+      method: 'POST', headers: { ...auth, Origin: `chrome-extension://${EXTENSION_ID}`, 'Content-Type': 'application/json' },
       body: JSON.stringify({ chatTitle: 'Meta AI', messageKey: createHash('sha256').update('outside').digest('base64url'), text: 'https://instagram.com/reel/OUTSIDE' }),
     });
     assert.equal(otherChat.status, 400);
@@ -61,7 +62,7 @@ test('loopback collector requires its token and accepts only the configured self
     const messageKey = createHash('sha256').update('self-chat-test').digest('base64url');
     const eventBody = { chatTitle: 'Message Yourself (You)', messageKey, text: 'https://instagram.com/reel/HTTP_TEST' };
     const accepted = await fetch(`${base}/v1/events`, {
-      method: 'POST', headers: { ...auth, Origin: 'chrome-extension://test', 'Content-Type': 'application/json' },
+      method: 'POST', headers: { ...auth, Origin: `chrome-extension://${EXTENSION_ID}`, 'Content-Type': 'application/json' },
       body: JSON.stringify(eventBody),
     });
     assert.equal(accepted.status, 200);
@@ -71,7 +72,7 @@ test('loopback collector requires its token and accepts only the configured self
     assert.equal(result.duplicate, false);
 
     const duplicate = await fetch(`${base}/v1/events`, {
-      method: 'POST', headers: { ...auth, Origin: 'chrome-extension://test', 'Content-Type': 'application/json' },
+      method: 'POST', headers: { ...auth, Origin: `chrome-extension://${EXTENSION_ID}`, 'Content-Type': 'application/json' },
       body: JSON.stringify(eventBody),
     });
     assert.equal((await duplicate.json() as { duplicate: boolean }).duplicate, true);

@@ -38,8 +38,72 @@
       .filter(Boolean);
     const anchors = [...node.querySelectorAll('a[href]')]
       .map((anchor) => anchor.href)
-      .filter((href) => /^https?:\/\/(?:www\.)?instagram\.com\//i.test(href));
+      .filter((href) => /^https?:\/\//i.test(href));
     return [...parts, ...anchors].join('\n').trim().slice(0, 10000);
+  }
+
+  function isOutgoing(node) {
+    return node.classList.contains('message-out') || Boolean(node.querySelector('.message-out')) ||
+      Boolean(node.getAttribute('data-id')?.startsWith('true_')) || Boolean(node.querySelector('[data-id^="true_"]'));
+  }
+
+  async function markOutbound(item, path, payload) {
+    return sendMessage('RTC_OUTBOUND_RESULT', { path, payload: { ...payload, chatTitle: SELF_CHAT_TITLE, outboxId: item.id } });
+  }
+
+  async function deliverOne() {
+    if (currentTitle() !== SELF_CHAT_TITLE) return false;
+    const response = await chrome.runtime.sendMessage({ type: 'RTC_OUTBOX_CLAIM', payload: { chatTitle: SELF_CHAT_TITLE } });
+    if (!response?.ok || !response.item) return false;
+    const item = response.item;
+    const fail = () => markOutbound(item, '/v1/outbox/failed', {});
+    try {
+      if (currentTitle() !== SELF_CHAT_TITLE || !/^Codex:/i.test(item.body)) { await fail(); return true; }
+      const composer = document.querySelector('#main [data-testid="conversation-compose-box-input"][contenteditable="true"]');
+      const sendButton = document.querySelector('#main [data-testid="send"]');
+      if (!composer || !sendButton || composer.textContent?.trim()) { await fail(); notifyStatus('Outbound message held: the self-chat composer was not in a safe state.'); return true; }
+      const beforeSend = new Set([...document.querySelectorAll(MESSAGE_SELECTOR)].map(messageIdentity).filter(Boolean));
+      const existingOutgoing = [...document.querySelectorAll(MESSAGE_SELECTOR)].some(isOutgoing);
+      if (!existingOutgoing) { await fail(); notifyStatus('Outbound message held: WhatsApp message direction could not be verified.'); return true; }
+
+      composer.focus();
+      document.execCommand('insertText', false, item.body);
+      composer.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: item.body }));
+      await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+      if (currentTitle() !== SELF_CHAT_TITLE || composer.textContent?.trim() !== item.body) { await fail(); return true; }
+      const readyButton = document.querySelector('#main [data-testid="send"]');
+      if (!readyButton) { await fail(); return true; }
+      readyButton.click();
+
+      const deadline = Date.now() + 10000;
+      while (Date.now() < deadline) {
+        if (currentTitle() !== SELF_CHAT_TITLE) { await fail(); return; }
+        const sent = [...document.querySelectorAll(MESSAGE_SELECTOR)].find((node) => {
+          const identity = messageIdentity(node);
+          return Boolean(identity && !beforeSend.has(identity) && isOutgoing(node) && extractVisibleMessageText(node) === item.body);
+        });
+        const identity = sent && messageIdentity(sent);
+        if (identity) {
+          const messageKey = await hashIdentity(identity);
+          const marked = await markOutbound(item, '/v1/outbox/sent', { messageKey });
+          if (!marked?.ok) {
+            await fail().catch(() => {});
+            notifyStatus('Message was sent, but the delivery receipt was not confirmed. The gateway will not retry it.');
+            return true;
+          }
+          notifyStatus('One Codex reply was sent to the configured self-chat.');
+          return true;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 250));
+      }
+      await fail();
+      notifyStatus('Outbound send could not be verified. It will not be retried automatically.');
+      return true;
+    } catch {
+      await fail().catch(() => {});
+      notifyStatus('Outbound send failed safely and will not be retried.');
+      return true;
+    }
   }
 
   async function getRows() {
@@ -130,7 +194,8 @@
           return;
         }
       }
-      notifyStatus('Self-chat active. Listening for new messages.');
+      const outboundHandled = currentTitle() === SELF_CHAT_TITLE ? await deliverOne() : false;
+      if (!outboundHandled) notifyStatus('Self-chat active. Listening for new messages.');
     } catch {
       notifyStatus('Collector unavailable. Check that npm run collector is running.');
     } finally {

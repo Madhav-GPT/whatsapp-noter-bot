@@ -1,99 +1,124 @@
 # WhatsApp Noter Bot
 
-A local-first inbox for Instagram Reels sent to WhatsApp Message Yourself, with targeted search through a local, read-only MCP server.
+A local-first WhatsApp Message Yourself gateway to the authenticated Codex App Server. It keeps the existing Reel library, SQLite database, and read-only MCP tools, and adds durable tasks, persistent Codex threads, a task controller, and a local result inbox.
 
-## Connection choice
+## How it works
 
-This project uses the official WhatsApp Web session already linked in Chrome, through a small unpacked Chrome extension. It does **not** create a Baileys connection or ask you to scan another QR code. Keep Chrome open, logged into WhatsApp Web, and leave your **Message Yourself (You)** chat selected while collecting.
+The Chrome extension observes only newly visible messages while the exact configured Message Yourself chat is selected. It sends hashed WhatsApp message IDs and message text to a loopback collector at `127.0.0.1`. The collector accepts the pinned Chrome extension origin and a private bearer token. It is not exposed on the network.
 
-The extension checks that exact chat title before querying message nodes. If a different chat is selected, it does not inspect that chat’s message container. On first start, it saves the latest visible self-chat message as a baseline and does not import earlier messages. It forwards only newly observed self-chat messages to the local collector. The collector stores Reel URLs, exact follow-up instructions linked to an active Reel, and minimal hashed event metadata needed for deduplication. It drops other self-chat text when no Reel is active.
+Instagram Reel links continue to enter the Reel library. Other links and standalone text become durable Codex tasks instead of being discarded. Codex runs through the installed `codex app-server` using the local ChatGPT/Codex sign-in. Tasks use persistent App Server threads; a clear recent follow-up continues the one matching thread, while `/continue <task-id> ...` targets a thread directly.
 
-Collection pauses when Chrome is closed, WhatsApp Web is logged out, the Mac sleeps, or another chat is selected. If the saved cursor is no longer in the visible message list, collection pauses; use the extension popup’s **Rebaseline this self-chat** button to skip through the latest visible message and resume. Rebaselining can skip messages that were not collected.
+Research and project inspection use Codex's read-only sandbox. The configured local project aliases are also read-only. Codex permission requests remain pending until you explicitly approve or deny them. No permission request is auto-approved.
+
+The gateway disables configured local MCP servers other than its read-only `reel-to-codex` knowledge server, and disables installed Codex plugins for each turn. The installed App Server also exposes a host-provided CUA MCP whose transport rejects a per-process disable override. Gateway instructions prohibit computer-control and browser-automation calls; for a hard tool boundary, disable that CUA MCP in Codex before starting the gateway.
 
 ## Setup
 
-Requirements: macOS, Node.js 22 or later, npm, and a linked WhatsApp Web session in Chrome.
+Requirements: macOS, Node.js 22 or later, npm, Chrome, and a logged-in Codex CLI (`codex login`).
 
 ```sh
-cd /path/to/whatsapp-noter-bot
 npm ci
 npm run setup -- --self-chat-title "Your Name (You)"
 ```
 
-Replace the example title with the exact title shown for your WhatsApp self-chat. Setup stores that title in `~/Library/Application Support/ReelToCodex/settings.json`, creates a random API token beside it, and writes an ignored `extension/config.js`. All are owner-only files and excluded from Git.
+Replace the example with the exact self-chat title shown in WhatsApp Web. Setup writes that value, a random collector token, and the ignored `extension/config.js` under `~/Library/Application Support/ReelToCodex`. These are owner-only local files and are excluded from Git.
 
-### Load the Chrome extension
+Load or reload this project's `extension` folder from `chrome://extensions` with Developer mode enabled. Keep WhatsApp Web open and select the configured Message Yourself chat. The extension takes a baseline first; it does not import old messages.
 
-1. Open `chrome://extensions`.
-2. Turn on **Developer mode**.
-3. Choose **Load unpacked** and select this project's `extension` folder.
-4. Keep WhatsApp Web open and select your **Message Yourself (You)** chat.
-5. Click the Reel to Codex extension icon. Wait for **Baseline set** (the first run) or **Listening for new messages**.
-
-The extension requests access to WhatsApp Web and the loopback collector on `127.0.0.1`. Review those permissions in Chrome before enabling it.
-
-## Live Phase 0 check
-
-Start the collector in a terminal and leave it running:
+Start the full local service in a terminal and leave it running:
 
 ```sh
-npm run collector
+npm run gateway
 ```
 
-After the popup reports that the baseline is ready, send two **new** messages to your self-chat:
+This starts the loopback collector and Codex task worker together. Stop it with `Ctrl+C`. `npm run collector` starts the collector alone when you want capture without task execution.
 
-1. A public Instagram Reel URL such as `https://www.instagram.com/reel/SHORTCODE/`.
-2. A follow-up instruction, for example: `Save this Reel. Research the technique and make it available to Codex.`
+## Send requests and control tasks
 
-The collector will save the Reel once and attach the next text to it. It does not send WhatsApp messages or fetch the Reel. Check the local result:
+Send a new URL or request in Message Yourself. For example:
+
+```text
+https://example.com
+Research this website and prepare a structured technical report.
+```
+
+The task is queued, run by Codex, and saved in SQLite. The full result is available locally even when WhatsApp sending is disabled:
 
 ```sh
-npm run status
-npm run db:check
+npm run gateway:inbox
+npm run gateway:ctl -- status
 ```
 
-Use `/done` to close the active item or `/cancel` to mark it cancelled. Only one active Reel is tracked: a later single Reel becomes active; a message containing multiple Reels clears the active item to avoid attaching notes ambiguously. The active item expires after 24 hours. Quoted-message association is not implemented in V1.
+Supported WhatsApp commands:
+
+- `/help` and `/status`
+- `/pause` and `/resume` (pause or resume new task execution)
+- `/stop <task-id>`
+- `/resume <task-id>` to recover a task interrupted by a restart
+- `/continue <task-id> <follow-up>`
+- `/codex <request>`
+- `/approve <code>` and `/deny <code>` for a Codex permission prompt
+- `/project <alias> <request>` for a registered local project
+- `/done` and `/cancel` for the active Reel item
+
+Natural-language follow-ups are attached to a previous thread only if there is exactly one completed recent task. Otherwise they start without mixing another task's context; use `/continue` when you want to name the target explicitly.
+
+Register project directories locally before referencing them in WhatsApp. Paths must be inside your home folder and cannot point into private configuration directories:
+
+```sh
+npm run gateway:ctl -- project add demo "$PWD"
+npm run gateway:ctl -- project list
+```
+
+A `/project` task waits until you explicitly approve its task ID. The project remains read-only. Codex approval codes and task state can also be reviewed in `npm run gateway:inbox`; the local CLI supports `approve <code>`, `deny <code>`, and `approve-task <task-id>`.
+
+## WhatsApp replies
+
+Outbound sending is disabled until its one-message test passes. Results remain in the local inbox. The extension's sender is constrained to the exact configured self-chat, requires a recognized outgoing-message marker and an empty composer, sends at most one message per minute, records the sent message ID hash, and filters `Codex:` replies to prevent loops. Ambiguous or failed sends are not retried automatically.
+
+After the updated extension is loaded and the configured self-chat is selected, the one-shot test can be queued with:
+
+```sh
+npm run gateway:ctl -- outbound-test
+```
+
+That command sends one harmless test message only if the extension can verify the exact chat and WhatsApp page state. A successful test enables concise task and status replies. The full report stays in the local task record. The browser automation uses WhatsApp Web's page structure, which can change; if the send cannot be verified, it is marked failed and results continue to appear in the local inbox.
+
+**The updated extension and outbound send have not yet been live-tested in this Chrome session.** Reloading the extension is required after code changes. No message has been sent by this implementation.
 
 ## Codex MCP
 
-The MCP server is read-only and starts separately from the collector. It does not connect to WhatsApp:
+The MCP server remains a separate, read-only interface for the local knowledge library. It now exposes ten tools, including task listing, task details, and report search. Start it with:
 
 ```sh
 npm run mcp
 ```
 
-Tools: `search_knowledge`, `get_knowledge_item`, `list_recent_items`, `list_pending_items`, `get_item_instructions`, `get_skill_candidates`, and `get_collector_status`.
+It does not read WhatsApp directly or run tasks. The gateway service owns task execution.
 
-To register it globally in Codex after local verification, run:
+## Operations and data
 
-```sh
-PROJECT_ROOT="$(pwd)"
-codex mcp add reel-to-codex -- \
-  "$(command -v node)" \
-  "$PROJECT_ROOT/node_modules/tsx/dist/cli.mjs" \
-  "$PROJECT_ROOT/src/mcp.ts"
-codex mcp list
-```
-
-Run the command from the project root. Codex stores MCP server settings in the shared `~/.codex/config.toml`; the CLI add command preserves other configured servers. Restart Codex or open a new local chat if the newly registered tools do not appear.
-
-## Operations and data location
-
-- Start collector: `npm run collector` (stop with `Ctrl+C`).
-- Collector/database status: `npm run status`.
-- Database integrity and FTS index: `npm run db:check`.
+- Start/stop the full gateway: `npm run gateway` / `Ctrl+C`.
+- Start capture only: `npm run collector`.
+- View task results and approvals: `npm run gateway:inbox`.
+- Pause execution: `npm run gateway:ctl -- pause`.
+- Inspect task totals: `npm run gateway:ctl -- status`.
+- Check collector state: `npm run status`.
+- Check database integrity: `npm run db:check`.
 - Automated checks: `npm test` and `npm run typecheck`.
 - SQLite database: `~/Library/Application Support/ReelToCodex/knowledge.sqlite`.
-- Collector bearer token: `~/Library/Application Support/ReelToCodex/collector-token`.
+- Collector token: `~/Library/Application Support/ReelToCodex/collector-token`.
 
-Disable the extension at `chrome://extensions` and stop the collector to pause collection. To revoke the browser’s WhatsApp session, use **WhatsApp on your phone → Linked devices → Chrome → Log out**. Removing the extension or local token does not revoke that linked-device session. No launch-at-login service is installed.
+The schema upgrades transactionally and keeps existing Reel, instruction, and findings data. A running task interrupted by a service restart is marked `needs_resume`; it is never silently replayed. Use `/resume <task-id>` after reviewing the local task status.
 
-## Privacy, security, and limits
+## Limits and privacy
 
-- The extension only reads messages while the exact configured self-chat title is active; it does not scan or import other chats or earlier self-chat history.
-- Only Reel messages and associated instructions are retained as message content. Other self-chat text is discarded after local inspection. Relevant WhatsApp DOM message IDs are SHA-256 hashed before they are sent to the collector; raw IDs are not retained.
-- The collector binds to `127.0.0.1`, requires the generated bearer token for ingestion, and logs no message content, phone numbers, or message IDs. Data stays on this Mac.
-- An extension with WhatsApp Web permission can technically read content visible on that site while enabled. The code’s self-chat gate narrows its behavior but cannot change the authority granted by Chrome. Review the extension code and permissions before loading it.
-- WhatsApp Web’s page structure can change. If the extension cannot find its message elements, it fails to collect; update the selectors only after a privacy-scoped check.
-- The database includes schema slots for findings and skill candidates, but V1 does not watch Reels, extract transcripts, research sources, or create/install skills. Codex can retrieve links and instructions and research them on demand. Findings must distinguish confirmed source evidence from research and unverified claims.
-- Reels and instructions are untrusted input. This system makes no external requests, runs no Reel-supplied commands, sends no automatic replies, and never edits another project.
+- Chrome must be open, WhatsApp Web logged in, and the exact self-chat selected. Selecting another chat pauses observation before the message container is queried.
+- Earlier chat history is not imported. If the visible cursor disappears, collection pauses until rebaseline.
+- Website, Reel, and repository content are untrusted input. The gateway wraps source text as untrusted and never treats it as trusted system instructions.
+- No files are edited and no software is installed by gateway tasks. Project aliases are read-only. Consequential actions require a separate supported Codex approval and remain blocked until you decide.
+- A gateway task is a separate Codex App Server thread; it does not take over an arbitrary conversation already open in Codex Desktop.
+- Codex authentication and usage limits follow the locally signed-in Codex account. This project does not require a separate paid API key.
+- The read-only sandbox protects local files; it does not constrain arbitrary actions exposed by MCP tools. Keep the CUA MCP disabled in Codex if you need a strict no-computer-control boundary.
+- The Chrome extension can technically read WhatsApp Web content while enabled. Its code checks the configured title before reading message nodes, and the collector stores message content only for the configured self-chat.
+- WhatsApp Web selectors are unofficial and may change. The sender fails closed if it cannot verify the composer, the configured chat, and a sent message.

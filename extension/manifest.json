@@ -1,8 +1,9 @@
 {
   "manifest_version": 3,
-  "name": "Reel to Codex self-chat collector",
-  "version": "1.0.0",
-  "description": "Collects new Instagram Reel links and notes only while the configured WhatsApp Message Yourself chat is active.",
+  "name": "WhatsApp to Codex Gateway",
+  "version": "2.0.0",
+  "description": "Connects the configured WhatsApp Message Yourself chat to a local Codex gateway with read-only task execution.",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEApLZ4kweG33bj20c0pITadPD2J1Ttb9VEL98U0OWv0iOUJYhAvxeXfOjaLavsl8dcIGLJAKjy/QzQIvuz881IcUzu8zgE3aTH66VvOFCLK/rDL52KZ0CxzZxHNELD0ZWjwiq7YSHem5kEof2z8kg8Lk/GEBALrRtgWwasjlH+9/nJ6Axh+T/+Hw6in/+/y0kF186a4dw877enAhQHujLigBw7udWHgKWNrlhrR4p8db+Zkw8YMxfDi0qUbwtwJ6JFbshwLjqzQvWSTAxc2sGdwlD3e8w5vYW0J9Z/kTG+YKC2DfoIP7SXpsHexQKhbylXGpGPzknMZUQLUpJJjkJM7QIDAQAB",
   "permissions": ["activeTab"],
   "host_permissions": [
     "https://web.whatsapp.com/*",
@@ -14,5 +15,5 @@
     "js": ["config.js", "content.js"],
     "run_at": "document_idle"
   }],
-  "action": { "default_popup": "popup.html", "default_title": "Reel to Codex" }
+  "action": { "default_popup": "popup.html", "default_title": "WhatsApp to Codex" }
 }
