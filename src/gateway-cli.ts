@@ -10,7 +10,7 @@ const library = await openLibrary();
 try {
   if (command === 'inbox') {
     const tasks = library.listTasks(50);
-    process.stdout.write(`Gateway ${library.isPaused() ? 'paused' : 'enabled'} · ${tasks.length} recent tasks\n\n`);
+    process.stdout.write(`Gateway ${library.isPaused() ? 'paused' : 'enabled'} · mode ${library.isAgentChatMode() ? 'agent-chat' : 'safe'} · ${tasks.length} recent tasks\n\n`);
     for (const task of tasks) {
       process.stdout.write(`${task.id.slice(0, 8)}  ${task.status.padEnd(16)} ${task.intent}\n`);
       process.stdout.write(`  ${task.requestText.replaceAll('\n', ' ').slice(0, 240)}\n`);
@@ -26,9 +26,14 @@ try {
     process.stdout.write('\nLocal result inbox:\n');
     for (const item of outbox) process.stdout.write(`[${item.deliveryState}] ${item.taskId?.slice(0, 8) ?? 'gateway'} ${item.createdAt}\n${item.body.slice(0, 500)}${item.body.length > 500 ? '…' : ''}\n\n`);
   } else if (command === 'status') {
-    const tasks = library.listTasks(100);
-    const counts = tasks.reduce<Record<string, number>>((result, task) => { result[task.status] = (result[task.status] ?? 0) + 1; return result; }, {});
-    process.stdout.write(JSON.stringify({ paused: library.isPaused(), counts, pendingApprovals: (library.pendingApprovals() as unknown[]).length }, null, 2) + '\n');
+    const counts = Object.fromEntries((library.db.prepare('SELECT status,count(*) AS count FROM gateway_tasks GROUP BY status').all() as Array<{ status: string; count: number }>).map(({ status, count }) => [status, count]));
+    const outboxCounts = library.db.prepare('SELECT delivery_state AS state,count(*) AS count FROM gateway_outbox GROUP BY delivery_state').all();
+    process.stdout.write(JSON.stringify({ paused: library.isPaused(), mode: library.isAgentChatMode() ? 'agent-chat' : 'safe', counts, notes: (library.db.prepare('SELECT count(*) AS n FROM gateway_notes').get() as { n: number }).n, outbox: outboxCounts, pendingApprovals: (library.pendingApprovals() as unknown[]).length }, null, 2) + '\n');
+  } else if (command === 'mode') {
+    const mode = (args[0] ?? '').toLowerCase();
+    if (!['safe', 'agent', 'agent-chat'].includes(mode)) throw new Error('Usage: npm run gateway:ctl -- mode safe|agent');
+    library.setAgentChatMode(mode !== 'safe');
+    process.stdout.write(`Gateway mode set to ${mode === 'safe' ? 'safe' : 'agent-chat'}.\n`);
   } else if (command === 'pause') {
     library.setPaused(true);
     process.stdout.write('Gateway paused. Incoming messages remain queued; active Codex task can finish.\n');
@@ -71,7 +76,7 @@ try {
   } else if (command === 'projects') {
     process.stdout.write(JSON.stringify(library.listProjects(), null, 2) + '\n');
   } else {
-    throw new Error('Commands: inbox, status, pause, resume [task-id], approve <code>, deny <code>, approve-task <task-id>, outbound-test, project add|list.');
+    throw new Error('Commands: inbox, status, mode safe|agent, pause, resume [task-id], approve <code>, deny <code>, approve-task <task-id>, outbound-test, project add|list.');
   }
 } catch (error) {
   process.stderr.write(`${error instanceof Error ? error.message : 'Gateway command failed.'}\n`);

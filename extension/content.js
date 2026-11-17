@@ -51,33 +51,55 @@
     return sendMessage('RTC_OUTBOUND_RESULT', { path, payload: { ...payload, chatTitle: SELF_CHAT_TITLE, outboxId: item.id } });
   }
 
+  function isEnabledControl(node) {
+    return node instanceof HTMLElement && !node.hasAttribute('disabled') && node.getAttribute('aria-disabled') !== 'true' && !node.classList.contains('disabled');
+  }
+
+  function clearUnsentComposer(composer, body) {
+    if (currentTitle() !== SELF_CHAT_TITLE || !composer.isConnected || composer.textContent?.trim() !== body) return;
+    composer.focus();
+    document.execCommand('selectAll', false);
+    document.execCommand('delete', false);
+    composer.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'deleteContentBackward' }));
+  }
+
   async function deliverOne() {
     if (currentTitle() !== SELF_CHAT_TITLE) return false;
     const response = await chrome.runtime.sendMessage({ type: 'RTC_OUTBOX_CLAIM', payload: { chatTitle: SELF_CHAT_TITLE } });
     if (!response?.ok || !response.item) return false;
     const item = response.item;
     const fail = () => markOutbound(item, '/v1/outbox/failed', {});
+    const uncertain = () => markOutbound(item, '/v1/outbox/uncertain', {});
+    let clicked = false;
     try {
       if (currentTitle() !== SELF_CHAT_TITLE || !/^Codex:/i.test(item.body)) { await fail(); return true; }
       const composer = document.querySelector('#main [data-testid="conversation-compose-box-input"][contenteditable="true"]');
-      const sendButton = document.querySelector('#main [data-testid="send"]');
-      if (!composer || !sendButton || composer.textContent?.trim()) { await fail(); notifyStatus('Outbound message held: the self-chat composer was not in a safe state.'); return true; }
+      if (!(composer instanceof HTMLElement) || !composer.isContentEditable || composer.textContent?.trim()) { await fail(); notifyStatus('Outbound message held: the self-chat composer was not in a safe state.'); return true; }
       const beforeSend = new Set([...document.querySelectorAll(MESSAGE_SELECTOR)].map(messageIdentity).filter(Boolean));
-      const existingOutgoing = [...document.querySelectorAll(MESSAGE_SELECTOR)].some(isOutgoing);
-      if (!existingOutgoing) { await fail(); notifyStatus('Outbound message held: WhatsApp message direction could not be verified.'); return true; }
 
       composer.focus();
       document.execCommand('insertText', false, item.body);
       composer.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: item.body }));
       await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
-      if (currentTitle() !== SELF_CHAT_TITLE || composer.textContent?.trim() !== item.body) { await fail(); return true; }
+      if (currentTitle() !== SELF_CHAT_TITLE || document.querySelector('#main [data-testid="conversation-compose-box-input"][contenteditable="true"]') !== composer || composer.textContent?.trim() !== item.body) {
+        clearUnsentComposer(composer, item.body);
+        await fail();
+        return true;
+      }
       const readyButton = document.querySelector('#main [data-testid="send"]');
-      if (!readyButton) { await fail(); return true; }
+      if (!isEnabledControl(readyButton)) {
+        clearUnsentComposer(composer, item.body);
+        await fail();
+        notifyStatus('Outbound message held: WhatsApp did not show an enabled send control after composition.');
+        return true;
+      }
+      if (currentTitle() !== SELF_CHAT_TITLE || !composer.isConnected || composer.textContent?.trim() !== item.body) { await fail(); return true; }
       readyButton.click();
+      clicked = true;
 
       const deadline = Date.now() + 10000;
       while (Date.now() < deadline) {
-        if (currentTitle() !== SELF_CHAT_TITLE) { await fail(); return; }
+        if (currentTitle() !== SELF_CHAT_TITLE) { await uncertain(); return true; }
         const sent = [...document.querySelectorAll(MESSAGE_SELECTOR)].find((node) => {
           const identity = messageIdentity(node);
           return Boolean(identity && !beforeSend.has(identity) && isOutgoing(node) && extractVisibleMessageText(node) === item.body);
@@ -87,7 +109,7 @@
           const messageKey = await hashIdentity(identity);
           const marked = await markOutbound(item, '/v1/outbox/sent', { messageKey });
           if (!marked?.ok) {
-            await fail().catch(() => {});
+            await uncertain().catch(() => {});
             notifyStatus('Message was sent, but the delivery receipt was not confirmed. The gateway will not retry it.');
             return true;
           }
@@ -96,11 +118,11 @@
         }
         await new Promise((resolve) => setTimeout(resolve, 250));
       }
-      await fail();
+      await uncertain();
       notifyStatus('Outbound send could not be verified. It will not be retried automatically.');
       return true;
     } catch {
-      await fail().catch(() => {});
+      await (clicked ? uncertain() : fail()).catch(() => {});
       notifyStatus('Outbound send failed safely and will not be retried.');
       return true;
     }

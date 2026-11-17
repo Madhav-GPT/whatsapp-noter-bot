@@ -19,7 +19,7 @@ test('the configured MCP entry launches over stdio and serves tools without a co
   try {
     await client.connect(transport);
     const tools = await client.listTools();
-    assert.equal(tools.tools.length, 10);
+    assert.equal(tools.tools.length, 13);
     const status = await client.callTool({ name: 'get_collector_status', arguments: {} });
     assert.ok(status.structuredContent);
   } finally {

@@ -67,7 +67,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return true;
   }
   if (message?.type === 'RTC_OUTBOUND_RESULT') {
-    if (!fromWhatsApp || message.payload?.chatTitle !== globalThis.REEL_TO_CODEX_SELF_CHAT_TITLE || !['/v1/outbox/sent', '/v1/outbox/failed'].includes(message.path)) {
+    if (!fromWhatsApp || message.payload?.chatTitle !== globalThis.REEL_TO_CODEX_SELF_CHAT_TITLE || !['/v1/outbox/sent', '/v1/outbox/failed', '/v1/outbox/uncertain'].includes(message.path)) {
       sendResponse({ ok: false, error: 'invalid_chat' });
       return false;
     }

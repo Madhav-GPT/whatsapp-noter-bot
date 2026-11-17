@@ -12,6 +12,7 @@ const link = 'https://www.instagram.com/reel/ORCH_123/?igsh=tracking';
 
 test('stores a Reel and consecutive exact instructions, then exposes FTS search', () => {
   const library = new KnowledgeLibrary(':memory:');
+  library.setAgentChatMode(true);
   const reel = library.ingest({ chatTitle: SELF_CHAT_TITLE, messageKey: messageKey('reel-1'), text: `Save ${link}`, observedAt: '2026-11-16T10:00:00Z' });
   assert.equal(reel.kind, 'reel');
   assert.equal(reel.itemIds.length, 1);
@@ -40,6 +41,7 @@ test('a second Reel becomes active; ambiguous context is queued as a general tas
   const second = library.ingest({ chatTitle: SELF_CHAT_TITLE, messageKey: messageKey('two'), text: 'https://instagram.com/reel/SECOND', observedAt: '2026-11-16T10:01:00Z' });
   assert.equal(library.ingest({ chatTitle: SELF_CHAT_TITLE, messageKey: messageKey('after-two'), text: 'Attach this to the second one.', observedAt: '2026-11-16T10:02:00Z' }).itemIds[0], second.itemIds[0]);
 
+  library.setAgentChatMode(true);
   const multi = library.ingest({ chatTitle: SELF_CHAT_TITLE, messageKey: messageKey('multi'), text: 'https://instagram.com/reel/THIRD https://instagram.com/reel/FOURTH', observedAt: '2026-11-16T10:03:00Z' });
   assert.equal(multi.itemIds.length, 2);
   assert.equal(library.ingest({ chatTitle: SELF_CHAT_TITLE, messageKey: messageKey('ambiguous-followup'), text: 'This association is unclear.', observedAt: '2026-11-16T10:04:00Z' }).kind, 'task');
@@ -59,7 +61,7 @@ test('deduplicates across process restarts and records migration version', async
     const reopened = new KnowledgeLibrary(path);
     assert.equal(reopened.ingest({ chatTitle: SELF_CHAT_TITLE, messageKey: key, text: link }).duplicate, true);
     assert.equal((reopened.db.prepare('SELECT count(*) AS n FROM source_items').get() as { n: number }).n, 1);
-    assert.deepEqual(reopened.db.prepare('SELECT version FROM schema_migrations ORDER BY version').all(), [{ version: 1 }, { version: 2 }, { version: 3 }]);
+    assert.deepEqual(reopened.db.prepare('SELECT version FROM schema_migrations ORDER BY version').all(), [{ version: 1 }, { version: 2 }, { version: 3 }, { version: 4 }]);
     assert.deepEqual(reopened.db.pragma('integrity_check'), [{ integrity_check: 'ok' }]);
     reopened.close();
   } finally {
@@ -76,16 +78,18 @@ test('rejects other chat titles including Meta AI and does not retain unrelated 
   library.close();
 });
 
-test('queues standalone self-chat text when no Reel is active', () => {
+test('safe mode saves standalone self-chat text as a note instead of starting a task', () => {
   const library = new KnowledgeLibrary(':memory:');
   library.setBaseline(SELF_CHAT_TITLE, null);
   const key = messageKey('irrelevant-self-chat-message');
   const result = library.ingest({ chatTitle: SELF_CHAT_TITLE, messageKey: key, text: 'A note unrelated to any Reel.' });
-  assert.equal(result.kind, 'task');
-  assert.ok(result.taskId);
+  assert.equal(result.kind, 'note');
+  assert.equal(result.taskId, undefined);
   assert.equal(library.getState().cursor, key);
   assert.equal((library.db.prepare('SELECT count(*) AS n FROM source_events').get() as { n: number }).n, 1);
-  assert.equal(library.getTask(result.taskId!)?.requestText, 'A note unrelated to any Reel.');
+  assert.equal((library.db.prepare('SELECT count(*) AS n FROM gateway_tasks').get() as { n: number }).n, 0);
+  assert.equal((library.getNote((library.listNotes()[0] as { id: string }).id)?.content), 'A note unrelated to any Reel.');
+  assert.equal(library.searchNotes('unrelated').length, 1);
   assert.equal((library.db.prepare('SELECT count(*) AS n FROM instructions').get() as { n: number }).n, 0);
   library.close();
 });
@@ -97,8 +101,8 @@ test('task queue survives restart, deduplicates on message key, and supports pau
     const first = new KnowledgeLibrary(path);
     first.setBaseline(SELF_CHAT_TITLE, null);
     const key = messageKey('gateway-research-request');
-    const accepted = first.ingest({ chatTitle: SELF_CHAT_TITLE, messageKey: key, text: 'Research https://example.com and prepare a report.' });
-    assert.equal(accepted.kind, 'task');
+    const accepted = first.ingest({ chatTitle: SELF_CHAT_TITLE, messageKey: key, text: '/research Research https://example.com and prepare a report.' });
+    assert.equal(accepted.kind, 'command');
     assert.ok(accepted.taskId);
     assert.equal(first.ingest({ chatTitle: SELF_CHAT_TITLE, messageKey: key, text: 'duplicate request' }).duplicate, true);
     first.setPaused(true);
@@ -107,7 +111,11 @@ test('task queue survives restart, deduplicates on message key, and supports pau
     const claimed = first.claimNextTask()!;
     assert.equal(claimed.id, accepted.taskId);
     first.setTaskThread(claimed.id, 'thread-research-1');
+    first.setTaskTurn(claimed.id, 'turn-research-1');
     first.finishTask(claimed.id, 'completed', '## Report\nSource: https://example.com');
+    assert.equal(first.getTask(claimed.id)?.turnId, 'turn-research-1', 'completed tasks retain the final turn association for recovery and audit');
+    assert.equal(first.getTask(claimed.id)?.result, '## Report\nSource: https://example.com');
+    first.setAgentChatMode(true);
     const followupKey = messageKey('gateway-followup');
     const followup = first.ingest({ chatTitle: SELF_CHAT_TITLE, messageKey: followupKey, text: 'Compare it with the previous research.' });
     assert.equal(followup.kind, 'task');
@@ -118,10 +126,38 @@ test('task queue survives restart, deduplicates on message key, and supports pau
     const reopened = new KnowledgeLibrary(path);
     assert.equal(reopened.getTask(accepted.taskId!)?.status, 'completed');
     assert.match(reopened.getTask(accepted.taskId!)?.result ?? '', /Source: https:\/\/example\.com/);
-    assert.equal((reopened.getOutbox() as Array<{ body: string }>)[0]?.body, '## Report\nSource: https://example.com');
+    const replies = reopened.getOutbox() as Array<{ body: string }>;
+    assert.ok(replies.some(({ body }) => body === `Research ${accepted.taskId!.slice(0, 8)} queued.`));
+    assert.ok(replies.some(({ body }) => body === `Task ${accepted.taskId!.slice(0, 8)} completed.\n\n## Report\nSource: https://example.com`));
     assert.equal(reopened.searchTasks('Report').length, 1);
     reopened.close();
   } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test('explicit /research creates one task in safe mode and /mode agent enables ordinary task routing', () => {
+  const library = new KnowledgeLibrary(':memory:');
+  const url = library.ingest({ chatTitle: SELF_CHAT_TITLE, messageKey: messageKey('plain-url-safe'), text: 'https://example.com' });
+  assert.equal(url.kind, 'note');
+  const command = library.ingest({ chatTitle: SELF_CHAT_TITLE, messageKey: messageKey('explicit-research'), text: '/research Summarize https://example.com' });
+  assert.equal(command.kind, 'command');
+  assert.equal(library.listTasks().length, 1);
+  library.ingest({ chatTitle: SELF_CHAT_TITLE, messageKey: messageKey('mode-agent'), text: '/mode agent' });
+  assert.equal(library.isAgentChatMode(), true);
+  const ordinary = library.ingest({ chatTitle: SELF_CHAT_TITLE, messageKey: messageKey('ordinary-agent'), text: 'Compare the report with our previous result.' });
+  assert.equal(ordinary.kind, 'task');
+  library.close();
+});
+
+test('an explicit Reel research command saves the Reel and associates it with one Codex task', () => {
+  const library = new KnowledgeLibrary(':memory:');
+  const reelUrl = 'https://www.instagram.com/reel/CODEX_REEL_1/';
+  const accepted = library.ingest({ chatTitle: SELF_CHAT_TITLE, messageKey: messageKey('research-reel-command'), text: `/research Summarize this Reel: ${reelUrl}` });
+  assert.equal(accepted.kind, 'command');
+  assert.equal(accepted.itemIds.length, 1);
+  assert.ok(accepted.taskId);
+  assert.equal((library.db.prepare('SELECT source_item_id AS sourceItemId FROM gateway_tasks WHERE id=?').get(accepted.taskId!) as { sourceItemId: string }).sourceItemId, accepted.itemIds[0]);
+  assert.equal(library.getItem(accepted.itemIds[0]!)?.originalUrl, reelUrl);
+  library.close();
 });
 
 test('gateway controls require explicit approval and projects are queued only after user approval', () => {
@@ -175,12 +211,23 @@ test('outbound stays local until a one-shot test passes, then rate-limits and su
   const echoed = library.ingest({ chatTitle: SELF_CHAT_TITLE, messageKey: botKey, text: testItem.body });
   assert.equal(echoed.kind, 'ignored');
   assert.equal(echoed.duplicate, true);
+    assert.equal(library.markOutboundSent(testId, botKey), undefined, 'duplicate receipts for the same verified WhatsApp identity are idempotent');
   assert.equal(library.isPaused(), false);
 
   const autoId = library.queueOutbox(null, 'A normal result');
   assert.match((library.db.prepare('SELECT body FROM gateway_outbox WHERE id=?').get(autoId) as { body: string }).body, /^Codex:/);
   library.db.prepare("UPDATE settings SET value=? WHERE key='outbound_last_attempt_at'").run(new Date(Date.now() - 61_000).toISOString());
   assert.equal(library.claimNextOutbound(SELF_CHAT_TITLE)?.id, autoId);
+  library.close();
+});
+
+test('interrupted outbound attempts become uncertain and are never claimed a second time', () => {
+  const library = new KnowledgeLibrary(':memory:');
+  const id = library.createOutboundTest();
+  assert.equal(library.claimOutbound(id, SELF_CHAT_TITLE)?.id, id);
+  library.markInterrupted();
+  assert.equal((library.getOutbox() as Array<{ id: string; deliveryState: string }>).find((item) => item.id === id)?.deliveryState, 'uncertain');
+  assert.equal(library.claimOutbound(id, SELF_CHAT_TITLE), null);
   library.close();
 });
 

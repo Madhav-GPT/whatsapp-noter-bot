@@ -23,30 +23,57 @@ test('local gateway runs a self-chat task through Codex App Server and saves its
   const token = randomBytes(32).toString('base64url');
   const title = 'Message Yourself (You)';
   const fakeCodex = join(dir, 'fake-codex');
-  const appServerLog = join(dir, 'app-server.jsonl');
+  const sourceCodexHome = join(dir, 'source-codex-home');
+  const appServerLog = join(dir, 'codex-home', 'app-server.jsonl');
   const projectDirectory = join(dir, 'approved-project');
+  await mkdir(sourceCodexHome);
+  await writeFile(join(sourceCodexHome, 'auth.json'), '{"auth_mode":"chatgpt","tokens":{}}\n', { mode: 0o600 });
+  await chmod(join(sourceCodexHome, 'auth.json'), 0o600);
   await mkdir(projectDirectory);
   const projectPath = await realpath(projectDirectory);
   const fakeServer = `#!/usr/bin/env node
-if (process.argv[2] === 'mcp' && process.argv[3] === 'list') { process.stdout.write(JSON.stringify({ servers: [] })); process.exit(0); }
 const readline = require('node:readline');
 const fs = require('node:fs');
 const lines = readline.createInterface({ input: process.stdin });
 const send = (value) => process.stdout.write(JSON.stringify(value) + '\\n');
+let turnStarted = false;
+if (process.argv[2] === 'login' && process.argv[3] === 'status') { process.stdout.write('Logged in using ChatGPT\\n'); process.exit(0); }
+if (process.argv[2] === 'mcp' && process.argv[3] === 'list') { process.stdout.write(JSON.stringify({ servers: [{ name: 'reel-to-codex', enabled: true }] })); process.exit(0); }
 lines.on('line', (line) => {
   const msg = JSON.parse(line);
-  fs.appendFileSync(process.env.GATEWAY_TEST_LOG, JSON.stringify(msg) + '\\n');
+  fs.appendFileSync(require('node:path').join(process.env.CODEX_HOME, 'app-server.jsonl'), JSON.stringify(msg) + '\\n');
   if (msg.id === undefined) return;
   if (msg.method === 'initialize') send({ jsonrpc: '2.0', id: msg.id, result: { userAgent: 'gateway-test' } });
   else if (msg.method === 'plugin/installed') send({ jsonrpc: '2.0', id: msg.id, result: { marketplaces: [] } });
+  else if (msg.method === 'mcpServerStatus/list') send({ jsonrpc: '2.0', id: msg.id, result: { data: turnStarted ? [{ name: 'reel-to-codex', runtimeStatus: 'connected' }] : [{ name: 'newton', pluginId: 'host-newton-plugin', runtimeStatus: 'starting' }, { name: 'reel-to-codex', runtimeStatus: 'connected' }], nextCursor: null } });
   else if (msg.method === 'thread/start') send({ jsonrpc: '2.0', id: msg.id, result: { thread: { id: 'thread-gateway-test' } } });
   else if (msg.method === 'thread/resume') send({ jsonrpc: '2.0', id: msg.id, result: { thread: { id: msg.params.threadId } } });
   else if (msg.method === 'turn/start') {
+    turnStarted = true;
     send({ jsonrpc: '2.0', id: msg.id, result: { turn: { id: 'turn-gateway-test' } } });
-    setTimeout(() => {
+    const finishTurn = () => {
       send({ jsonrpc: '2.0', method: 'turn/started', params: { threadId: 'thread-gateway-test', turn: { id: 'turn-gateway-test' } } });
-      send({ jsonrpc: '2.0', method: 'turn/completed', params: { threadId: 'thread-gateway-test', turn: { id: 'turn-gateway-test', status: 'completed', items: [{ type: 'agentMessage', text: 'Example report. Source: https://example.com' }] } } });
+      send({ jsonrpc: '2.0', method: 'item/agentMessage/delta', params: { threadId: 'other-thread', turnId: 'turn-gateway-test', itemId: 'wrong-item', delta: 'This must not leak.' } });
+      send({ jsonrpc: '2.0', method: 'item/completed', params: { threadId: 'thread-gateway-test', turnId: 'other-turn', item: { id: 'wrong-turn-item', type: 'agentMessage', phase: 'final_answer', text: 'Wrong turn response.' } } });
+      send({ jsonrpc: '2.0', method: 'item/completed', params: { threadId: 'thread-gateway-test', turnId: 'turn-gateway-test', item: { id: 'commentary-item', type: 'agentMessage', phase: 'commentary', text: 'Internal progress should not be the result.' } } });
+      send({ jsonrpc: '2.0', method: 'item/agentMessage/delta', params: { threadId: 'thread-gateway-test', turnId: 'turn-gateway-test', itemId: 'final-item', delta: 'Example report. Source: https://example.com' } });
+      send({ jsonrpc: '2.0', method: 'item/completed', params: { threadId: 'thread-gateway-test', turnId: 'turn-gateway-test', item: { id: 'final-item', type: 'agentMessage', phase: 'final_answer', text: 'Example report. Source: https://example.com' } } });
+      send({ jsonrpc: '2.0', method: 'turn/completed', params: { threadId: 'thread-gateway-test', turn: { id: 'wrong-turn', status: 'completed', items: [] } } });
+      send({ jsonrpc: '2.0', method: 'turn/completed', params: { threadId: 'thread-gateway-test', turn: { id: 'turn-gateway-test', status: 'completed', items: [] } } });
+    };
+    if (String(msg.params.cwd).includes('approved-project')) {
+      const path = require('node:path').join(msg.params.cwd, 'README.md');
+      send({ jsonrpc: '2.0', method: 'turn/started', params: { threadId: 'thread-gateway-test', turn: { id: 'turn-gateway-test' } } });
+      send({ jsonrpc: '2.0', method: 'item/started', params: { threadId: 'thread-gateway-test', turnId: 'turn-gateway-test', startedAtMs: Date.now(), item: { id: 'file-change-1', type: 'fileChange', status: 'inProgress', changes: [{ path, kind: 'update', diff: '@@ test @@' }] } } });
+      setTimeout(() => send({ jsonrpc: '2.0', id: 9001, method: 'item/fileChange/requestApproval', params: { threadId: 'thread-gateway-test', turnId: 'turn-gateway-test', itemId: 'file-change-1', startedAtMs: Date.now(), reason: 'Update the README' } }), 25);
+    } else setTimeout(finishTurn, 25);
+  } else if (msg.id === 9001 && !msg.method) {
+    if (msg.result?.decision === 'accept') setTimeout(() => {
+      send({ jsonrpc: '2.0', method: 'item/completed', params: { threadId: 'thread-gateway-test', turnId: 'turn-gateway-test', item: { id: 'file-change-1', type: 'fileChange', status: 'completed', changes: [{ path: 'approved-project/README.md', kind: 'update', diff: '@@ test @@' }] } } });
+      send({ jsonrpc: '2.0', method: 'item/completed', params: { threadId: 'thread-gateway-test', turnId: 'turn-gateway-test', item: { id: 'final-item', type: 'agentMessage', phase: 'final_answer', text: 'Project report.' } } });
+      send({ jsonrpc: '2.0', method: 'turn/completed', params: { threadId: 'thread-gateway-test', turn: { id: 'turn-gateway-test', status: 'completed', items: [] } } });
     }, 25);
+    else send({ jsonrpc: '2.0', method: 'turn/completed', params: { threadId: 'thread-gateway-test', turn: { id: 'turn-gateway-test', status: 'failed', error: { message: 'File change denied.' }, items: [] } } });
   } else send({ jsonrpc: '2.0', id: msg.id, error: { code: -32601, message: 'unsupported test method' } });
 });
 `;
@@ -57,7 +84,7 @@ lines.on('line', (line) => {
 
   const child = spawn(process.execPath, [join(process.cwd(), 'node_modules/tsx/dist/cli.mjs'), join(process.cwd(), 'src/service.ts')], {
     cwd: process.cwd(),
-    env: { ...process.env, REEL_TO_CODEX_DATA_DIR: dir, REEL_TO_CODEX_PORT: String(port), REEL_TO_CODEX_SELF_CHAT_TITLE: title, CODEX_BIN: fakeCodex, GATEWAY_TEST_LOG: appServerLog },
+    env: { ...process.env, CODEX_HOME: sourceCodexHome, REEL_TO_CODEX_DATA_DIR: dir, REEL_TO_CODEX_PORT: String(port), REEL_TO_CODEX_SELF_CHAT_TITLE: title, CODEX_BIN: fakeCodex },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   let output = '';
@@ -77,10 +104,10 @@ lines.on('line', (line) => {
     assert.equal(ready, true, `Gateway did not start: ${output}`);
 
     const messageKey = createHash('sha256').update('example-research-task').digest('base64url');
-    const request = { chatTitle: title, messageKey, text: 'Research this website and prepare a structured technical report: https://example.com' };
+    const request = { chatTitle: title, messageKey, text: '/research Research this website and prepare a structured technical report: https://example.com' };
     const accepted = await fetch(`${base}/v1/events`, { method: 'POST', headers: auth, body: JSON.stringify(request) });
     const acceptedBody = await accepted.json() as { kind: string; duplicate: boolean; taskId: string };
-    assert.equal(acceptedBody.kind, 'task');
+    assert.equal(acceptedBody.kind, 'command');
     assert.equal(acceptedBody.duplicate, false);
 
     const duplicate = await fetch(`${base}/v1/events`, { method: 'POST', headers: auth, body: JSON.stringify(request) });
@@ -96,6 +123,7 @@ lines.on('line', (line) => {
     }
     assert.equal(task?.status, 'completed', `Task did not finish: ${output}`);
     assert.match(task?.result ?? '', /Source: https:\/\/example\.com/);
+    assert.doesNotMatch(task?.result ?? '', /Wrong turn response|Internal progress|must not leak/);
     const outbox = await fetch(`${base}/v1/outbox`, { headers: { Authorization: `Bearer ${token}` } });
     const inbox = await outbox.json() as { items: Array<{ body: string; deliveryState: string; deliveryKind: string }> };
     assert.equal(inbox.items[0]?.deliveryState, 'local_pending');
@@ -114,6 +142,20 @@ lines.on('line', (line) => {
     const approvalKey = createHash('sha256').update('approve-project-task').digest('base64url');
     const approved = await fetch(`${base}/v1/events`, { method: 'POST', headers: auth, body: JSON.stringify({ chatTitle: title, messageKey: approvalKey, text: `/approve ${projectTaskId.slice(0, 8)}` }) });
     assert.equal((await approved.json() as { kind: string }).kind, 'command');
+    let approvalBody = '';
+    for (let i = 0; i < 80; i += 1) {
+      const response = await fetch(`${base}/v1/outbox?limit=30`, { headers: { Authorization: `Bearer ${token}` } });
+      const outbox = await response.json() as { items: Array<{ body: string }> };
+      approvalBody = outbox.items.find((item) => item.body.includes('Codex needs approval for task'))?.body ?? '';
+      if (approvalBody) break;
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+    assert.match(approvalBody, /README\.md/);
+    const fileApprovalCode = approvalBody.match(/Approve: \/approve ([A-F0-9]+)/)?.[1];
+    assert.ok(fileApprovalCode, 'in-project file changes must expose an explicit approval code');
+    const fileApprovalKey = createHash('sha256').update('approve-in-project-file-change').digest('base64url');
+    const fileApproved = await fetch(`${base}/v1/events`, { method: 'POST', headers: auth, body: JSON.stringify({ chatTitle: title, messageKey: fileApprovalKey, text: `/approve ${fileApprovalCode}` }) });
+    assert.equal((await fileApproved.json() as { kind: string }).kind, 'command');
     let projectTask: { status: string } | undefined;
     for (let i = 0; i < 80; i += 1) {
       const response = await fetch(`${base}/v1/tasks?limit=10`, { headers: { Authorization: `Bearer ${token}` } });
@@ -124,10 +166,16 @@ lines.on('line', (line) => {
     }
     assert.equal(projectTask?.status, 'completed', `Approved project task did not finish: ${output}`);
     const requests = (await readFile(appServerLog, 'utf8')).split('\n').filter(Boolean).map((line) => JSON.parse(line) as { method?: string; params?: Record<string, unknown> });
+    const initialize = requests.find((message) => message.method === 'initialize');
+    assert.equal((initialize?.params?.capabilities as { experimentalApi?: boolean } | undefined)?.experimentalApi, true);
     const projectThread = requests.find((message) => message.method === 'thread/start' && message.params?.cwd === projectPath);
-    assert.equal(projectThread?.params?.sandbox, 'workspace-write');
+    assert.equal(projectThread?.params?.permissions, 'gateway-project');
+    assert.deepEqual(projectThread?.params?.runtimeWorkspaceRoots, [projectPath]);
     const projectTurn = requests.find((message) => message.method === 'turn/start' && message.params?.cwd === projectPath);
-    assert.deepEqual(projectTurn?.params?.sandboxPolicy, { type: 'workspaceWrite', writableRoots: [projectPath], networkAccess: false });
+    assert.equal(projectTurn?.params?.permissions, 'gateway-project');
+    assert.deepEqual(projectTurn?.params?.runtimeWorkspaceRoots, [projectPath]);
+    const firstTurn = requests.find((message) => message.method === 'turn/start' && message.params?.cwd !== projectPath);
+    assert.ok((firstTurn?.params?.disabledPluginIds as string[] | undefined)?.includes('host-newton-plugin'));
   } finally {
     child.kill('SIGTERM');
     await new Promise<void>((resolve) => {

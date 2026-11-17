@@ -4,23 +4,38 @@ import { EventEmitter } from 'node:events';
 
 type JsonRpc = { id?: string | number; method?: string; params?: Record<string, unknown>; result?: unknown; error?: { code?: number; message?: string; data?: unknown } };
 
+export class CodexAppServerError extends Error {
+  constructor(message: string, readonly code?: number, readonly data?: unknown) { super(message); this.name = 'CodexAppServerError'; }
+}
+
+export class CodexAppServerExitedError extends Error {
+  constructor(message: string) { super(message); this.name = 'CodexAppServerExitedError'; }
+}
+
+export class GatewayToolBoundaryError extends Error {
+  constructor(message: string) { super(message); this.name = 'GatewayToolBoundaryError'; }
+}
+
 /** Minimal JSONL client for the supported local Codex App Server protocol. */
 export class CodexAppServerClient extends EventEmitter {
   private child: ChildProcessWithoutNullStreams | null = null;
   private nextId = 1;
   private readonly pending = new Map<string | number, { resolve: (value: unknown) => void; reject: (error: Error) => void; timer: NodeJS.Timeout }>();
-  private disabledPluginIds: string[] = [];
+  private disabledPluginIds = new Set<string>();
 
-  constructor(private readonly executable = process.env.CODEX_BIN || 'codex', private readonly configuredMcpNames?: string[]) { super(); }
+  constructor(private readonly executable = process.env.CODEX_BIN || 'codex', private readonly environment: NodeJS.ProcessEnv = process.env) { super(); }
+
+  get isRunning(): boolean { return this.child !== null && this.child.exitCode === null; }
 
   async start(): Promise<void> {
     if (this.child) return;
-    const names = this.configuredMcpNames ?? this.readConfiguredMcpNames();
-    // Codex 0.164 rejects a command-line override for the host-provided CUA transport.
-    // Keep that transport under the user's existing Codex policy; disable other configured servers.
-    const configArgs = names.filter((name) => name !== 'reel-to-codex' && name !== 'cua_repl')
-      .flatMap((name) => ['-c', `mcp_servers.${name}.enabled=false`]);
-    const child = spawn(this.executable, ['app-server', ...configArgs, '--listen', 'stdio://'], { stdio: ['pipe', 'pipe', 'pipe'], env: process.env });
+    const names = this.readConfiguredMcpNames();
+    if (names.length !== 1 || names[0] !== 'reel-to-codex') throw new GatewayToolBoundaryError('Gateway Codex home must expose only the read-only reel-to-codex MCP server.');
+    const auth = spawnSync(this.executable, ['login', 'status'], { encoding: 'utf8', timeout: 10_000, maxBuffer: 1_000_000, env: this.environment });
+    if (auth.error || auth.status !== 0 || !/logged in/i.test(`${auth.stdout ?? ''}\n${auth.stderr ?? ''}`)) {
+      throw new Error('The isolated gateway Codex home is not signed in. Run `npm run gateway:login` once, then restart the gateway.');
+    }
+    const child = spawn(this.executable, ['app-server', '--listen', 'stdio://'], { stdio: ['pipe', 'pipe', 'pipe'], env: this.environment });
     this.child = child;
     const lines = createInterface({ input: child.stdout });
     lines.on('line', (line) => this.receive(line));
@@ -30,30 +45,78 @@ export class CodexAppServerClient extends EventEmitter {
     });
     child.once('error', (error) => this.failAll(error));
     child.once('exit', (code, signal) => {
-      this.failAll(new Error(`Codex App Server exited (${code ?? signal ?? 'unknown'}).`));
+      this.failAll(new CodexAppServerExitedError(`Codex App Server exited (${code ?? signal ?? 'unknown'}).`));
       this.child = null;
       this.emit('exit', { code, signal });
     });
     try {
       await this.request('initialize', {
         clientInfo: { name: 'whatsapp-noter-bot', title: 'WhatsApp to Codex Gateway', version: '0.2.0' },
-        capabilities: { experimentalApi: false },
+        // Named permission profiles and runtime workspace roots are currently part of
+        // the installed App Server's experimental capability surface.
+        capabilities: { experimentalApi: true },
       });
       this.notify('initialized', {});
       const installed = await this.request('plugin/installed', {}, 10_000);
       const marketplaces = (installed as { marketplaces?: Array<{ plugins?: Array<{ id?: string; installed?: boolean; enabled?: boolean }> }> })?.marketplaces ?? [];
-      this.disabledPluginIds = marketplaces.flatMap((marketplace) => marketplace.plugins ?? [])
-        .filter((plugin) => plugin.installed && plugin.enabled && typeof plugin.id === 'string').map((plugin) => plugin.id!);
+      const activePlugins = marketplaces.flatMap((marketplace) => marketplace.plugins ?? []).filter((plugin) => plugin.installed && plugin.enabled);
+      if (activePlugins.length) throw new GatewayToolBoundaryError('Gateway Codex home unexpectedly contains enabled plugins; refusing to run tasks.');
+      for (const plugin of marketplaces.flatMap((marketplace) => marketplace.plugins ?? [])) {
+        if (plugin.installed && typeof plugin.id === 'string') this.disabledPluginIds.add(plugin.id);
+      }
     } catch (error) {
-      this.stop();
+      await this.stop();
       throw error;
     }
   }
 
   getDisabledPluginIds(): string[] { return [...this.disabledPluginIds]; }
 
+  private async readMcpInventory(threadId?: string): Promise<Array<Record<string, unknown>>> {
+    const all: unknown[] = [];
+    let cursor: string | undefined;
+    for (let page = 0; page < 10; page += 1) {
+      const result = await this.request('mcpServerStatus/list', { detail: 'toolsAndAuthOnly', limit: 100, ...(threadId ? { threadId } : {}), ...(cursor ? { cursor } : {}) }, 15_000);
+      const value = result as { data?: unknown; nextCursor?: unknown };
+      if (!Array.isArray(value?.data)) throw new GatewayToolBoundaryError('Codex App Server did not return an MCP inventory; refusing to run without a verified tool boundary.');
+      all.push(...value.data);
+      if (typeof value.nextCursor !== 'string' || !value.nextCursor) { cursor = undefined; break; }
+      cursor = value.nextCursor;
+      if (page === 9) throw new GatewayToolBoundaryError('Codex App Server MCP inventory exceeded the safe paging limit.');
+    }
+    if (cursor) throw new GatewayToolBoundaryError('Codex App Server MCP inventory was incomplete.');
+    if (all.some((entry) => !entry || typeof entry !== 'object' || typeof (entry as { name?: unknown }).name !== 'string')) {
+      throw new GatewayToolBoundaryError('Codex App Server returned a malformed MCP inventory; refusing to run without a verified tool boundary.');
+    }
+    return all as Array<Record<string, unknown>>;
+  }
+
+  async disableUnexpectedPluginMcpServers(threadId: string): Promise<void> {
+    const inventory = await this.readMcpInventory(threadId);
+    const names = new Set(inventory.map((entry) => String(entry.name)));
+    if (!names.has('reel-to-codex')) throw new GatewayToolBoundaryError('The read-only reel-to-codex MCP server is missing from the effective App Server inventory.');
+    const knowledgeServer = inventory.find((entry) => entry.name === 'reel-to-codex');
+    if (knowledgeServer?.pluginId) throw new GatewayToolBoundaryError('The reel-to-codex server resolved to a plugin provider instead of the isolated local server.');
+    const unexpected = inventory.filter((entry) => entry.name !== 'reel-to-codex');
+    for (const entry of unexpected) {
+      if (typeof entry.pluginId === 'string' && entry.pluginId) this.disabledPluginIds.add(entry.pluginId);
+      else if (entry.runtimeStatus !== 'disabled') {
+        throw new GatewayToolBoundaryError(`Codex App Server exposed a non-plugin MCP server outside the isolated allowlist (${String(entry.name)}); the task was blocked.`);
+      }
+    }
+  }
+
+  async verifyMcpInventory(threadId: string): Promise<void> {
+    const inventory = await this.readMcpInventory(threadId);
+    const names = [...new Set(inventory.map((entry) => String(entry.name)))];
+    const knowledgeServer = inventory.find((entry) => entry.name === 'reel-to-codex');
+    if (names.length !== 1 || names[0] !== 'reel-to-codex' || knowledgeServer?.pluginId || knowledgeServer?.runtimeStatus !== 'connected') {
+      throw new GatewayToolBoundaryError(`Codex App Server exposed an unexpected MCP tool set (${names.join(', ') || 'none'}); the task was blocked.`);
+    }
+  }
+
   private readConfiguredMcpNames(): string[] {
-    const result = spawnSync(this.executable, ['mcp', 'list', '--json'], { encoding: 'utf8', timeout: 10_000, maxBuffer: 2_000_000, env: process.env });
+    const result = spawnSync(this.executable, ['mcp', 'list', '--json'], { encoding: 'utf8', timeout: 10_000, maxBuffer: 2_000_000, env: this.environment });
     if (result.error || result.status !== 0) throw new Error('Could not safely enumerate configured MCP servers; refusing to start Codex with inherited tools.');
     let parsed: unknown;
     try { parsed = JSON.parse(result.stdout); }
@@ -79,12 +142,18 @@ export class CodexAppServerClient extends EventEmitter {
       }, timeoutMs);
       timer.unref();
       this.pending.set(id, { resolve, reject, timer });
-      child.stdin.write(`${JSON.stringify({ jsonrpc: '2.0', id, method, params })}\n`, (error) => {
-        if (!error) return;
+      try {
+        child.stdin.write(`${JSON.stringify({ jsonrpc: '2.0', id, method, params })}\n`, (error) => {
+          if (!error) return;
+          clearTimeout(timer);
+          this.pending.delete(id);
+          reject(error);
+        });
+      } catch (error) {
         clearTimeout(timer);
         this.pending.delete(id);
-        reject(error);
-      });
+        reject(error instanceof Error ? error : new Error('Could not write to Codex App Server.'));
+      }
     });
   }
 
@@ -116,7 +185,7 @@ export class CodexAppServerClient extends EventEmitter {
       if (!pending) return;
       clearTimeout(pending.timer);
       this.pending.delete(message.id);
-      if (message.error) pending.reject(new Error(message.error.message || `App Server error ${message.error.code ?? 'unknown'}`));
+      if (message.error) pending.reject(new CodexAppServerError(message.error.message || `App Server error ${message.error.code ?? 'unknown'}`, message.error.code, message.error.data));
       else pending.resolve(message.result);
       return;
     }
@@ -136,6 +205,7 @@ export class CodexAppServerClient extends EventEmitter {
     const child = this.child;
     if (!child) return;
     this.child = null;
+    this.failAll(new CodexAppServerExitedError('Codex App Server was stopped.'));
     if (child.exitCode !== null) return;
     child.kill('SIGTERM');
     await new Promise<void>((resolve) => {

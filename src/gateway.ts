@@ -1,15 +1,17 @@
 import { mkdir, realpath, stat } from 'node:fs/promises';
-import { join } from 'node:path';
-import { homedir } from 'node:os';
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import type { GatewayTask, KnowledgeLibrary } from './library.js';
 import { openLibrary } from './library.js';
-import { CodexAppServerClient } from './app-server.js';
+import { CodexAppServerClient, CodexAppServerError, CodexAppServerExitedError, GatewayToolBoundaryError } from './app-server.js';
+import { prepareGatewayCodexHome, isolatedCodexEnvironment, resolveCodexExecutable } from './codex-home.js';
+import { TurnMonitor } from './turn-monitor.js';
 import { DATA_DIR } from './paths.js';
 
 const MAX_TASK_MS = 8 * 60 * 1000;
+const MAX_APPROVAL_WAIT_MS = 24 * 60 * 60 * 1000;
 const POLL_MS = 500;
-type ActiveTurn = { threadId: string; turnId: string | null };
-type ApprovalRequest = { id: string | number; method: string; params: Record<string, unknown> };
+type ActiveTurn = { threadId: string; turnId: string | null; monitor: TurnMonitor | null; approvalCodes: Set<string>; fileChangePaths: Map<string, string[]>; cancelRequested: boolean };
+type ApprovalRequest = { id: string | number; method: string; params: Record<string, unknown>; taskId: string };
 
 function asRecord(value: unknown): Record<string, unknown> {
   return value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : {};
@@ -48,7 +50,37 @@ function isApprovalMethod(method: string): boolean {
   return ['item/commandExecution/requestApproval','item/fileChange/requestApproval','applyPatchApproval','execCommandApproval','item/permissions/requestApproval'].includes(method);
 }
 
-async function runTask(client: CodexAppServerClient, library: KnowledgeLibrary, task: GatewayTask, workspace: string, activeTurns: Map<string, ActiveTurn>): Promise<void> {
+function collectPaths(value: unknown, key = '', output: string[] = []): string[] {
+  if (typeof value === 'string' && /(?:path|file|root|directory)/i.test(key)) output.push(value);
+  else if (Array.isArray(value)) for (const item of value) collectPaths(item, key, output);
+  else if (value && typeof value === 'object') for (const [childKey, item] of Object.entries(value as Record<string, unknown>)) collectPaths(item, childKey, output);
+  return output;
+}
+
+async function canonicalTarget(candidate: string): Promise<string> {
+  let current = resolve(candidate);
+  const missing: string[] = [];
+  while (true) {
+    try { return resolve(await realpath(current), ...missing.reverse()); }
+    catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code !== 'ENOENT' && code !== 'ENOTDIR') throw error;
+      const parent = dirname(current);
+      if (parent === current) throw error;
+      missing.push(basename(current));
+      current = parent;
+    }
+  }
+}
+
+async function isPathInside(root: string, candidate: string): Promise<boolean> {
+  const requested = isAbsolute(candidate) ? candidate : resolve(root, candidate);
+  const [canonicalRoot, path] = await Promise.all([realpath(root), canonicalTarget(requested)]);
+  const rel = relative(canonicalRoot, path);
+  return rel === '' || (!rel.startsWith(`..${sep}`) && rel !== '..' && !isAbsolute(rel));
+}
+
+async function runTask(client: CodexAppServerClient, library: KnowledgeLibrary, task: GatewayTask, workspace: string, activeTurns: Map<string, ActiveTurn>, approvalRequests: Map<string, ApprovalRequest>): Promise<void> {
   const saved = library.db.prepare('SELECT project_alias AS projectAlias FROM gateway_tasks WHERE id=?').get(task.id) as { projectAlias: string | null };
   if (saved.projectAlias && !library.isProjectTaskApproved(task.id)) throw new Error('Project task has no recorded explicit approval.');
   const project = saved.projectAlias ? library.getProject(saved.projectAlias) : null;
@@ -59,16 +91,18 @@ async function runTask(client: CodexAppServerClient, library: KnowledgeLibrary, 
     if (actualPath !== project.localPath || !info.isDirectory()) throw new Error('Registered project path changed. Re-register the canonical project directory before continuing.');
   }
   const cwd = project?.localPath ?? workspace;
-  const sandbox = project ? 'workspace-write' : 'read-only';
+  const permissions = project ? 'gateway-project' : 'gateway-readonly';
   const developerInstructions = project
     ? 'You are a local personal assistant running behind a private WhatsApp self-chat gateway. The current project task was explicitly approved by the user. Make only the requested changes within the registered project directory; preserve unrelated work. Do not use computer control, browser automation, messaging, publishing, network access, software installation, global settings, or commits and pushes. Follow source-trust limits in each task.'
     : 'You are a local personal assistant running behind an authenticated, private WhatsApp self-chat gateway. Use only read-only research and analysis. Never use computer control, browser automation, messaging, publishing, file writing, or MCP tools other than the read-only reel-to-codex knowledge tools. Follow source-trust limits in each task and keep thread context scoped to that user task and explicit follow-ups.';
+  if (library.getTask(task.id)?.status === 'cancelled') return;
   const threadResult = task.threadId
-    ? await client.request('thread/resume', { threadId: task.threadId, cwd, approvalPolicy: 'on-request', sandbox })
+    ? await client.request('thread/resume', { threadId: task.threadId, cwd, approvalPolicy: 'on-request', permissions, runtimeWorkspaceRoots: [cwd] })
     : await client.request('thread/start', {
         cwd,
         approvalPolicy: 'on-request',
-        sandbox,
+        permissions,
+        runtimeWorkspaceRoots: [cwd],
         ephemeral: false,
         developerInstructions,
       });
@@ -78,63 +112,91 @@ async function runTask(client: CodexAppServerClient, library: KnowledgeLibrary, 
   library.setTaskThread(task.id, threadId);
   const activeTurn = activeTurns.get(task.id);
   if (activeTurn) activeTurn.threadId = threadId;
-  const completion = new Promise<{ status: string; result: string; error?: string }>((resolve) => {
-    let lastProgressAt = 0;
-    const onNotification = (message: { method?: string; params?: Record<string, unknown> }) => {
-      const params = message.params ?? {};
-      if (message.method === 'turn/started' && params.threadId === threadId) {
-        const turn = asRecord(params.turn);
-        const current = activeTurns.get(task.id);
-        if (current) current.turnId = typeof turn.id === 'string' ? turn.id : current.turnId;
-      }
-      if (message.method === 'item/agentMessage/delta' && params.threadId === threadId) {
-        const delta = typeof params.delta === 'string' ? params.delta.trim() : '';
-        if (delta && Date.now() - lastProgressAt >= 10000) {
-          lastProgressAt = Date.now();
-          library.appendTaskEvent(task.id, 'progress', delta.slice(0, 1000));
+  await client.disableUnexpectedPluginMcpServers(threadId);
+  if (library.getTask(task.id)?.status === 'cancelled') return;
+  const active = activeTurns.get(task.id);
+  const monitor = new TurnMonitor(client, {
+    taskId: task.id,
+    threadId,
+    executionTimeoutMs: MAX_TASK_MS,
+    approvalTimeoutMs: MAX_APPROVAL_WAIT_MS,
+    onProgress: (text) => library.appendTaskEvent(task.id, 'progress', text),
+    onTurnId: (turnId) => {
+      if (active) active.turnId = turnId;
+      library.setTaskTurn(task.id, turnId);
+    },
+  });
+  if (active) active.monitor = monitor;
+  let result;
+  try {
+    if (library.getTask(task.id)?.status === 'cancelled') monitor.cancel();
+    else {
+      const startResult = await client.request('turn/start', {
+        threadId,
+        permissions,
+        runtimeWorkspaceRoots: [cwd],
+        disabledPluginIds: client.getDisabledPluginIds(),
+        input: [{ type: 'text', text: formatPrompt(library, task), text_elements: [] }],
+        cwd,
+        approvalPolicy: 'on-request',
+      });
+      const startTurn = asRecord(asRecord(startResult).turn);
+      if (typeof startTurn.id === 'string') {
+        monitor.setTurnId(startTurn.id);
+        if (active) active.turnId = startTurn.id;
+        library.setTaskTurn(task.id, startTurn.id);
+        if (library.getTask(task.id)?.status === 'cancelled') {
+          active?.monitor?.cancel();
+          await client.request('turn/interrupt', { threadId, turnId: startTurn.id }).catch(() => undefined);
         }
       }
-      if (message.method !== 'turn/completed' || params.threadId !== threadId) return;
-      const turn = asRecord(params.turn);
-      const items = Array.isArray(turn.items) ? turn.items : [];
-      const text = items.filter((item) => asRecord(item).type === 'agentMessage').map((item) => String(asRecord(item).text ?? '')).filter(Boolean).join('\n\n').trim();
-      const status = String(turn.status ?? 'failed');
-      const error = asRecord(turn.error).message;
-      client.off('notification', onNotification);
-      resolve({ status, result: text, ...(typeof error === 'string' ? { error } : {}) });
-    };
-    client.on('notification', onNotification);
-  });
-  const startResult = await client.request('turn/start', {
-    threadId,
-    disabledPluginIds: client.getDisabledPluginIds(),
-    input: [{ type: 'text', text: formatPrompt(library, task), text_elements: [] }],
-    cwd,
-    approvalPolicy: 'on-request',
-    sandboxPolicy: project
-      ? { type: 'workspaceWrite', writableRoots: [project.localPath], networkAccess: false }
-      : { type: 'readOnly', networkAccess: true },
-  });
-  const startTurn = asRecord(asRecord(startResult).turn);
-  const active = activeTurns.get(task.id);
-  if (active && typeof startTurn.id === 'string') active.turnId = startTurn.id;
-  const timeout = new Promise<{ status: string; result: string; error: string }>((resolve) => {
-    const timer = setTimeout(() => resolve({ status: 'timeout', result: '', error: 'Task exceeded the eight-minute limit and was interrupted.' }), MAX_TASK_MS);
-    timer.unref();
-  });
-  const result = await Promise.race([completion, timeout]);
+      try {
+        await client.verifyMcpInventory(threadId);
+      } catch (error) {
+        if (active?.turnId) await client.request('turn/interrupt', { threadId, turnId: active.turnId }).catch(() => undefined);
+        monitor.cancel();
+        throw error;
+      }
+    }
+    result = await monitor.completion;
+  } finally {
+    monitor.dispose();
+    if (active) active.monitor = null;
+  }
   if (library.getTask(task.id)?.status === 'cancelled') {
     library.appendTaskEvent(task.id, 'interrupted', 'Turn stopped after an explicit cancellation.');
   } else if (result.status === 'timeout') {
     const current = activeTurns.get(task.id);
     if (current?.turnId) await client.request('turn/interrupt', { threadId, turnId: current.turnId }).catch(() => undefined);
     library.finishTask(task.id, 'needs_resume', null, result.error);
+  } else if (result.status === 'approval_timeout') {
+    const current = activeTurns.get(task.id);
+    if (current?.turnId) await client.request('turn/interrupt', { threadId, turnId: current.turnId }).catch(() => undefined);
+    library.expireTaskApprovals(task.id);
+    if (current) {
+      for (const code of current.approvalCodes) {
+        const pending = [...approvalRequests.entries()].find(([key]) => key === code)?.[1];
+        if (pending) client.respondError(pending.id, -32000, 'Gateway approval expired.');
+        approvalRequests.delete(code);
+      }
+      current.approvalCodes.clear();
+    }
+    library.finishTask(task.id, 'needs_resume', null, result.error);
   } else if (result.status === 'completed') {
-    library.finishTask(task.id, 'completed', result.result || 'Codex completed this task without a final text response.');
+    library.finishTask(task.id, 'completed', result.result || 'Codex completed the turn but returned no final answer. Use /continue <task-id> to ask again.');
   } else if (result.status === 'interrupted') {
     library.finishTask(task.id, 'needs_resume', null, 'Codex turn was interrupted. Use /resume <task-id> to continue.');
+    if (!client.isRunning) {
+      library.setPaused(true);
+      library.queueOutbox(null, 'Gateway paused because Codex App Server exited. Check the terminal and sign-in, then restart the gateway and review the task before /resume.');
+    }
   } else {
-    library.finishTask(task.id, 'failed', null, result.error || 'Codex turn failed.');
+    const error = result.error || 'Codex turn failed.';
+    library.finishTask(task.id, 'failed', null, error);
+    if (['unauthorized', 'usageLimitExceeded', 'rateLimitExceeded'].includes(result.errorCode ?? '') || /unauthori[sz]ed|usage limit|rate limit/i.test(error)) {
+      library.setPaused(true);
+      library.queueOutbox(null, `Codex paused the gateway: ${error.slice(0, 500)}. Resolve the sign-in or usage issue, then send /resume.`);
+    }
   }
 }
 
@@ -143,22 +205,95 @@ export async function startGateway(): Promise<{ close: () => Promise<void> }> {
   const workspace = join(DATA_DIR, 'gateway-workspace');
   await mkdir(workspace, { recursive: true, mode: 0o700 });
   library.markInterrupted();
-  const client = new CodexAppServerClient();
+  const codexHome = await prepareGatewayCodexHome(DATA_DIR);
+  const executable = resolveCodexExecutable(process.env.CODEX_BIN || 'codex');
+  const client = new CodexAppServerClient(executable, isolatedCodexEnvironment(codexHome, executable));
   const activeTurns = new Map<string, ActiveTurn>();
   let busy = false;
   let stopped = false;
   let taskTimer: NodeJS.Timeout | undefined;
+  let activePoll: Promise<void> | null = null;
+  let activeTaskPromise: Promise<void> | null = null;
   const approvalRequests = new Map<string, ApprovalRequest>();
 
   client.on('stderr', (line: string) => process.stderr.write(`[codex] ${line}`));
   client.on('protocolError', (error: Error) => process.stderr.write(`[gateway] ${error.message}\n`));
+  const trackFileChanges = (message: { method?: string; params?: Record<string, unknown> }) => {
+    const params = message.params ?? {};
+    if (message.method !== 'item/started' && message.method !== 'fileChange/patchUpdated' && message.method !== 'item/completed') return;
+    const active = [...activeTurns.values()].find((candidate) => candidate.threadId === params.threadId && (!candidate.turnId || candidate.turnId === params.turnId));
+    if (!active) return;
+    if (message.method === 'item/started') {
+      const item = asRecord(params.item);
+      if (item.type === 'fileChange' && typeof item.id === 'string') active.fileChangePaths.set(item.id, collectPaths(item));
+    } else if (message.method === 'fileChange/patchUpdated' && typeof params.itemId === 'string') {
+      active.fileChangePaths.set(params.itemId, collectPaths(params.changes));
+    } else {
+      const item = asRecord(params.item);
+      if (item.type === 'fileChange' && typeof item.id === 'string') active.fileChangePaths.delete(item.id);
+    }
+  };
+  client.on('notification', trackFileChanges);
   client.on('serverRequest', (message: { id: string | number; method: string; params?: Record<string, unknown> }) => {
     const params = message.params ?? {};
     if (isApprovalMethod(message.method)) {
       const task = [...activeTurns.entries()].find(([, active]) => active.threadId === params.threadId)?.[0];
       if (!task) { client.respondError(message.id, -32000, 'No active gateway task is associated with this approval.'); return; }
+      const active = activeTurns.get(task)!;
+      if (typeof params.turnId !== 'string' || (active.turnId && params.turnId !== active.turnId) || !active.monitor || active.monitor.isFinished) {
+        client.respondError(message.id, -32000, 'This approval request does not match the active task turn.');
+        return;
+      }
+      if (message.method === 'item/permissions/requestApproval' || params.networkApprovalContext || params.additionalPermissions || params.proposedExecpolicyAmendment || params.grantRoot) {
+        // Any request to widen filesystem, network, or command policy is denied and never
+        // enters the user approval queue. The named permission profile is immutable per turn.
+        client.respond(message.id, message.method === 'item/permissions/requestApproval' ? { permissions: {}, scope: 'turn', strictAutoReview: true } : { decision: 'decline' });
+        library.recordPolicyDenied(task, 'A permission, network, root, or execution-policy widening request is outside the gateway task scope.');
+        return;
+      }
+      if (message.method === 'item/commandExecution/requestApproval') {
+        client.respond(message.id, { decision: 'decline' });
+        library.recordPolicyDenied(task, 'Command approval would widen execution beyond the gateway sandbox and was denied.');
+        return;
+      }
+      if (message.method === 'applyPatchApproval' || message.method === 'execCommandApproval') {
+        client.respond(message.id, serverResponseFor(message.method, false, params));
+        library.recordPolicyDenied(task, 'A legacy patch or command approval has no verifiable in-project boundary and was denied.');
+        return;
+      }
+      if (message.method === 'item/fileChange/requestApproval') {
+        const taskInfo = library.getTask(task);
+        const projectAlias = taskInfo?.intent.startsWith('project:') ? taskInfo.intent.slice('project:'.length) : null;
+        const project = projectAlias ? library.getProject(projectAlias) : null;
+        const itemId = typeof params.itemId === 'string' ? params.itemId : '';
+        const paths = [...collectPaths(params), ...(active.fileChangePaths.get(itemId) ?? [])];
+        if (!project || paths.length === 0) {
+          client.respond(message.id, { decision: 'decline' });
+          library.recordPolicyDenied(task, project ? 'A proposed file change was outside the registered project directory or had no verifiable path.' : 'File changes are disabled for read-only research tasks.');
+          return;
+        }
+        void Promise.all(paths.map((path) => isPathInside(project.localPath, path))).then((allowed) => {
+          const liveTask = library.getTask(task);
+          if (allowed.some((value) => !value) || !liveTask || liveTask.status === 'cancelled' || activeTurns.get(task) !== active || active.monitor === null || active.monitor.isFinished || active.cancelRequested) {
+            client.respond(message.id, { decision: 'decline' });
+            if (allowed.some((value) => !value)) library.recordPolicyDenied(task, 'A proposed file change resolved outside the registered project directory.');
+            return;
+          }
+          const code = library.createApproval(task, message.id, message.method, { ...params, proposedPaths: paths });
+          active.approvalCodes.add(code);
+          active.monitor?.setApprovalPending(true);
+          approvalRequests.set(code, { id: message.id, method: message.method, params, taskId: task });
+        }).catch((error: unknown) => {
+          client.respondError(message.id, -32000, 'The gateway could not verify the requested file path.');
+          library.recordPolicyDenied(task, 'The gateway could not verify a proposed file path; it was denied.');
+          process.stderr.write(`[gateway] file approval path check failed: ${error instanceof Error ? error.message : 'unknown error'}\n`);
+        });
+        return;
+      }
       const code = library.createApproval(task, message.id, message.method, params);
-      approvalRequests.set(code, { id: message.id, method: message.method, params });
+      active.approvalCodes.add(code);
+      active.monitor.setApprovalPending(true);
+      approvalRequests.set(code, { id: message.id, method: message.method, params, taskId: task });
       return;
     }
     // Unknown server initiated work is never approved or executed by the gateway.
@@ -176,13 +311,19 @@ export async function startGateway(): Promise<{ close: () => Promise<void> }> {
       if (!pending) continue;
       const response = serverResponseFor(approval.method, approval.state === 'approved', pending.params);
       if (response !== undefined) client.respond(pending.id, response);
+      const active = activeTurns.get(pending.taskId);
+      if (active) {
+        active.approvalCodes.delete(approval.code);
+        active.monitor?.setApprovalPending(false);
+      }
       approvalRequests.delete(approval.code);
     }
     for (const [id, active] of activeTurns) {
       const task = library.getTask(id);
-      if (task?.status === 'cancelled' && active.turnId) {
-        await client.request('turn/interrupt', { threadId: active.threadId, turnId: active.turnId }).catch(() => undefined);
-        activeTurns.delete(id);
+      if (task?.status === 'cancelled' && !active.cancelRequested) {
+        active.cancelRequested = true;
+        active.monitor?.cancel();
+        if (active.turnId) await client.request('turn/interrupt', { threadId: active.threadId, turnId: active.turnId }).catch(() => undefined);
       }
     }
     if (busy || library.isPaused()) return;
@@ -190,27 +331,47 @@ export async function startGateway(): Promise<{ close: () => Promise<void> }> {
     if (!task) return;
     busy = true;
     const threadId = task.threadId ?? '';
-    activeTurns.set(task.id, { threadId, turnId: null });
-    try {
-      await runTask(client, library, task, workspace, activeTurns);
-    } catch (error) {
+    activeTurns.set(task.id, { threadId, turnId: null, monitor: null, approvalCodes: new Set(), fileChangePaths: new Map(), cancelRequested: false });
+    activeTaskPromise = runTask(client, library, task, workspace, activeTurns, approvalRequests).catch((error) => {
       const message = error instanceof Error ? error.message : 'Codex gateway task failed.';
-      library.finishTask(task.id, 'failed', null, message.slice(0, 2000));
+      const recoverable = error instanceof CodexAppServerExitedError;
+      library.finishTask(task.id, recoverable ? 'needs_resume' : 'failed', null, message.slice(0, 2000));
+      if (error instanceof GatewayToolBoundaryError) {
+        library.setPaused(true);
+        library.queueOutbox(null, `Gateway paused because Codex exposed a tool outside its isolated allowlist. No turn was started. Review the local configuration before sending /resume.`);
+      }
+      const authOrQuota = error instanceof CodexAppServerError && (error.code === 401 || /unauthori[sz]ed|usage limit|rate limit/i.test(message));
+      if (recoverable || authOrQuota) library.setPaused(true);
+      if (recoverable) library.queueOutbox(null, 'Gateway paused because Codex App Server exited. Check the terminal and sign-in, then restart the gateway and review the task before /resume.');
+      if (authOrQuota) library.queueOutbox(null, `Codex paused the gateway: ${message.slice(0, 500)}. Resolve the sign-in or usage issue, then send /resume.`);
       process.stderr.write(`[gateway] task ${task.id.slice(0, 8)} failed: ${message}\n`);
-    } finally {
+    }).finally(() => {
+      const active = activeTurns.get(task.id);
+      if (active) {
+        for (const code of active.approvalCodes) approvalRequests.delete(code);
+      }
       activeTurns.delete(task.id);
       busy = false;
-    }
+      activeTaskPromise = null;
+    });
   };
-  taskTimer = setInterval(() => { void poll(); }, POLL_MS);
+  const schedulePoll = () => {
+    if (stopped || activePoll) return;
+    activePoll = poll().finally(() => { activePoll = null; });
+  };
+  taskTimer = setInterval(schedulePoll, POLL_MS);
   return {
     close: async () => {
       if (stopped) return;
       stopped = true;
       if (taskTimer) clearInterval(taskTimer);
+      client.off('notification', trackFileChanges);
       for (const active of activeTurns.values()) {
+        active.monitor?.cancel();
         if (active.turnId) await client.request('turn/interrupt', { threadId: active.threadId, turnId: active.turnId }, 5000).catch(() => undefined);
       }
+      await activePoll;
+      await activeTaskPromise;
       library.markInterrupted();
       await client.stop();
       library.close();

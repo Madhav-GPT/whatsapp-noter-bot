@@ -8,6 +8,7 @@
     "setup": "tsx src/setup.ts",
     "collector": "tsx src/collector.ts",
     "gateway": "tsx src/service.ts",
+    "gateway:login": "tsx src/gateway-login.ts",
     "gateway:ctl": "tsx src/gateway-cli.ts",
     "gateway:inbox": "tsx src/gateway-cli.ts inbox",
     "gateway:project": "tsx src/gateway-cli.ts project",

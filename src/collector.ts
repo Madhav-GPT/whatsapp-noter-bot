@@ -166,6 +166,16 @@ const server = createServer(async (req, res) => {
       send(res, 200, { ok: true }, origin);
       return;
     }
+    if (req.method === 'POST' && req.url === '/v1/outbox/uncertain') {
+      const body = await readJson(req);
+      if (body.chatTitle !== SELF_CHAT_TITLE || typeof body.outboxId !== 'string') {
+        send(res, 400, { error: 'invalid_outbound_result' }, origin);
+        return;
+      }
+      library.markOutboundUncertain(body.outboxId);
+      send(res, 200, { ok: true }, origin);
+      return;
+    }
     if (req.method === 'POST' && req.url === '/v1/cursor-gap') {
       const body = await readJson(req);
       if (body.chatTitle !== SELF_CHAT_TITLE) {
