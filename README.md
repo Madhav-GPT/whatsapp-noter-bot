@@ -25,7 +25,16 @@ Replace the example with the exact self-chat title shown in WhatsApp Web. Setup 
 
 Load or reload this project's `extension` folder from `chrome://extensions` with Developer mode enabled. Keep WhatsApp Web open and select the configured Message Yourself chat. The extension takes a baseline first; it does not import old messages.
 
-Sign in to the gateway's isolated Codex home when needed, then start the service:
+Install automatic startup for your Mac user:
+
+```sh
+npm run gateway:startup -- install
+npm run gateway:startup -- status
+```
+
+This installs two per-user macOS LaunchAgents: one starts the gateway when you log in and restarts it if it exits unexpectedly; the other opens WhatsApp Web in Chrome at login. The gateway and collector run in the background and write logs under `~/Library/Logs/ReelToCodex`. The WhatsApp page still needs an active login and the exact configured self-chat selected. If WhatsApp does not restore that chat, select it once in Chrome. Collection remains paused on other chats.
+
+Sign in to the gateway's isolated Codex home when needed. For a manual foreground run, start the service with:
 
 ```sh
 npm run gateway:login
@@ -34,13 +43,13 @@ npm run gateway
 
 If the existing local Codex sign-in is available, `gateway:login` detects it automatically. Otherwise it opens Codex's normal sign-in flow once for the isolated gateway home.
 
-Start the full local service in a terminal and leave it running:
+For a manual foreground run, leave this command running:
 
 ```sh
 npm run gateway
 ```
 
-This starts the loopback collector and Codex task worker together. Stop it with `Ctrl+C`. `npm run collector` starts the collector alone when you want capture without task execution.
+This starts the loopback collector and Codex task worker together. Stop it with `Ctrl+C`. Do not run it while the automatic gateway service is active; use `npm run gateway:startup -- stop` first. `npm run collector` starts the collector alone when you want capture without task execution.
 
 ## Send requests and control tasks
 
@@ -111,6 +120,8 @@ It does not read WhatsApp directly or run tasks. The gateway service owns task e
 ## Operations and data
 
 - Start/stop the full gateway: `npm run gateway` / `Ctrl+C`.
+- Install/status/start/stop automatic login startup: `npm run gateway:startup -- install|status|start|stop`.
+- Remove automatic login startup: `npm run gateway:startup -- uninstall`.
 - Start capture only: `npm run collector`.
 - View task results and approvals: `npm run gateway:inbox`.
 - Pause execution: `npm run gateway:ctl -- pause`.
@@ -127,7 +138,7 @@ The schema upgrades transactionally and keeps existing Reel, instruction, and fi
 
 ## Limits and privacy
 
-- Chrome must be open, WhatsApp Web logged in, and the exact self-chat selected. Closing Chrome or WhatsApp Web stops collection and reply delivery. Selecting another chat pauses observation before message nodes are queried and blocks outbound sends.
+- The gateway starts at macOS user login and restarts after unexpected exits. It cannot work while the Mac is asleep, shut down, or logged out. Chrome must also remain open, WhatsApp Web must be logged in, and the exact self-chat must be selected. Automatic startup opens WhatsApp Web in Chrome at login, but if WhatsApp restores another chat or shows sign-in, collection waits for you to select the self-chat or sign in. Selecting another chat pauses observation before message nodes are queried and blocks outbound sends.
 - If the Mac sleeps, the gateway and Chrome stop polling. After wake, collection continues only when the browser is open, WhatsApp Web is logged in, and the exact self-chat is selected. If the last visible cursor has disappeared, collection stays paused until you review the chat and choose Rebaseline.
 - Earlier chat history is not imported. If the visible cursor disappears, collection pauses until rebaseline.
 - Website, Reel, and repository content are untrusted input. The gateway wraps source text as untrusted and never treats it as trusted system instructions.
