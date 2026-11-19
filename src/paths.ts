@@ -6,7 +6,14 @@ export const DATA_DIR = process.env.REEL_TO_CODEX_DATA_DIR ?? join(homedir(), 'L
 export const DATABASE_PATH = process.env.REEL_TO_CODEX_DATABASE ?? join(DATA_DIR, 'knowledge.sqlite');
 export const TOKEN_PATH = join(DATA_DIR, 'collector-token');
 export const SETTINGS_PATH = join(DATA_DIR, 'settings.json');
+export const TELEGRAM_TOKEN_PATH = join(DATA_DIR, 'telegram-bot-token');
+export const TELEGRAM_OWNER_PATH = join(DATA_DIR, 'telegram-owner.json');
+export const TELEGRAM_OFFSET_PATH = join(DATA_DIR, 'telegram-update-offset');
+export const TELEGRAM_STATE_PATH = join(DATA_DIR, 'telegram-state.json');
 export const EXTENSION_ID = 'bigaphijjgaoaddakapcaebjfgbfmcnd';
+export const TELEGRAM_CHAT_TITLE = 'Telegram Bot (Private)';
+
+export type TransportKind = 'whatsapp' | 'telegram';
 
 function loadSelfChatTitle(): string {
   const override = process.env.REEL_TO_CODEX_SELF_CHAT_TITLE;
@@ -21,3 +28,16 @@ function loadSelfChatTitle(): string {
 }
 
 export const SELF_CHAT_TITLE = loadSelfChatTitle();
+
+function loadTransport(): TransportKind {
+  if (process.env.REEL_TO_CODEX_TRANSPORT === 'telegram') return 'telegram';
+  try {
+    const settings = JSON.parse(readFileSync(SETTINGS_PATH, 'utf8')) as { transport?: unknown };
+    if (settings.transport === 'telegram') return 'telegram';
+  } catch {
+    // Use the compatibility transport until Telegram is configured.
+  }
+  return 'whatsapp';
+}
+
+export const ACTIVE_TRANSPORT = loadTransport();

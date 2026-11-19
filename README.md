@@ -1,150 +1,75 @@
-# WhatsApp Noter Bot
+# Personal Codex Gateway
 
-A local-first WhatsApp Message Yourself gateway to the authenticated Codex App Server. It keeps the existing Reel library, SQLite database, and read-only MCP tools, and adds durable tasks, persistent Codex threads, a task controller, and a local result inbox.
+A local-first personal assistant that receives requests in a private Telegram bot chat, stores them in SQLite, and runs approved work through the authenticated Codex App Server. Telegram's official Bot API is the message transport. WhatsApp is not paired or required.
 
-## How it works
-
-The Chrome extension observes only newly visible messages while the exact configured Message Yourself chat is selected. It sends hashed WhatsApp message IDs and message text to a loopback collector at `127.0.0.1`. The collector accepts the pinned Chrome extension origin and a private bearer token. It is not exposed on the network.
-
-Instagram Reel links continue to enter the Reel library. Safe mode is the default: ordinary text and standalone links become searchable local notes. Use `/codex`, `/research`, `/repo`, `/continue`, or `/project` when you want Codex to run. `/mode agent` opts in to treating ordinary messages as Codex requests; `/mode safe` turns that behavior off. Tasks use persistent App Server threads; natural follow-ups attach only when one recent completed task is a clear match, while `/continue <task-id> ...` targets a thread directly.
-
-General research uses Codex's read-only sandbox. A registered project task waits for your explicit approval before Codex gets write access limited to that project's directory; project tasks have no network access. File-change requests stay pending until you approve or deny them; requests to widen filesystem, network, root, or command policy are denied by the gateway. No permission escalation is auto-approved.
-
-The gateway starts Codex in a separate configuration home containing only the read-only `reel-to-codex` MCP server. It disables plugins, Apps, remote plugins, hooks, memories, and multi-agent features; strips unrelated shell environment variables; disables shell network access; and selects a named filesystem permission profile for each task. It checks the App Server's effective MCP list for each task and pauses if an unexpected provider, including a host computer-use tool, appears. The gateway links the existing local Codex auth file when available; otherwise use `npm run gateway:login` once for the isolated home.
-
-## Setup
-
-Requirements: macOS, Node.js 22 or later, npm, Chrome, and the local Codex CLI.
-
-```sh
-npm ci
-npm run setup -- --self-chat-title "Your Name (You)"
-```
-
-Replace the example with the exact self-chat title shown in WhatsApp Web. Setup writes that value, a random collector token, and the ignored `extension/config.js` under `~/Library/Application Support/ReelToCodex`. These are owner-only local files and are excluded from Git.
-
-Load or reload this project's `extension` folder from `chrome://extensions` with Developer mode enabled. At page startup, the extension opens the configured Message Yourself chat by its exact title (using WhatsApp's sidebar search if needed). It reads message nodes only after that exact chat is selected. The extension takes a baseline first; it does not import old messages.
-
-Install automatic startup for your Mac user:
-
-```sh
-npm run gateway:startup -- install
-npm run gateway:startup -- status
-```
-
-This installs two per-user macOS LaunchAgents: one starts the gateway when you log in and restarts it if it exits unexpectedly; the other opens WhatsApp Web in Chrome at login. The gateway and collector run in the background and write logs under `~/Library/Logs/ReelToCodex`. WhatsApp Web still needs an active login. Once signed in, the extension selects the configured self-chat automatically. If WhatsApp asks you to sign in or its interface prevents the exact chat from being found, collection waits safely until that is resolved. Collection remains paused on other chats.
-
-Sign in to the gateway's isolated Codex home when needed. For a manual foreground run, start the service with:
-
-```sh
-npm run gateway:login
-npm run gateway
-```
-
-If the existing local Codex sign-in is available, `gateway:login` detects it automatically. Otherwise it opens Codex's normal sign-in flow once for the isolated gateway home.
-
-For a manual foreground run, leave this command running:
-
-```sh
-npm run gateway
-```
-
-This starts the loopback collector and Codex task worker together. Stop it with `Ctrl+C`. Do not run it while the automatic gateway service is active; use `npm run gateway:startup -- stop` first. `npm run collector` starts the collector alone when you want capture without task execution.
-
-## Send requests and control tasks
-
-In safe mode, ordinary messages are saved as notes. Start Codex explicitly:
+## Architecture
 
 ```text
-/research Research this website and prepare a structured technical report: https://example.com
+Telegram private bot chat
+  ↕ HTTPS Bot API (long polling)
+Local Telegram transport ── SQLite task queue ── Codex App Server
 ```
 
-Other commands include `/codex <request>`, `/repo <request>`, `/project <alias> <request>`, and `/continue <task-id> <follow-up>`. To opt into ordinary conversational requests, send `/mode agent`; `/mode safe` returns to note-first behavior. The current mode appears in `/status` and the local inbox.
+The Telegram worker uses `getUpdates` long polling, so the Mac needs no public inbound port. The worker accepts only a direct private chat from the paired Telegram account. It ignores groups, channels, other users, and bot messages. It downloads no media; text and captions are supported. Message updates are deduplicated in SQLite, and the Telegram update offset is saved locally after processing.
 
-Tasks run through Codex App Server and are saved in SQLite. The full result is available locally even when WhatsApp sending is disabled:
+Telegram bot chats are not end-to-end encrypted. Telegram and the local bot backend can process messages sent to the bot; do not send passwords, recovery codes, or secrets. Bot API updates remain available for up to 24 hours, so a Mac that is off longer may miss messages. See [Telegram's Bot API](https://core.telegram.org/bots/api) and [bot security FAQ](https://telegram.org/faq?setln=en).
 
-```sh
-npm run gateway:inbox
-npm run gateway:ctl -- status
-```
+## First-time setup
 
-Supported WhatsApp commands:
+1. In Telegram, message [@BotFather](https://t.me/BotFather), run `/newbot`, and keep the token private.
+2. In a terminal in this project, run `npm run telegram:configure`. Paste the BotFather token at the hidden prompt. The command verifies it and stores it with owner-only file permissions under `~/Library/Application Support/ReelToCodex`.
+3. Run `npm run telegram:pair`. Open the new bot's private chat, tap **Start**, and send the one-time `/pair <code>` printed in the terminal. Only that Telegram account is accepted afterward.
+4. Check setup with `npm run telegram:status`.
+5. Start the gateway with `npm run gateway` or install per-user macOS login startup with `npm run gateway:startup -- install`. Startup installation requires a configured and paired Telegram bot; it removes the old WhatsApp-to-Chrome opener and starts the Telegram gateway at login.
 
-- `/help` and `/status`
-- `/pause` and `/resume` (pause or resume new task execution)
-- `/stop <task-id>`
-- `/resume <task-id>` to recover a task interrupted by a restart
-- `/continue <task-id> <follow-up>`
-- `/codex <request>`
-- `/research <request>` and `/repo <request>`
-- `/mode safe` or `/mode agent`
-- `/approve <code>` and `/deny <code>` for a Codex permission prompt
-- `/project <alias> <request>` for a registered local project
-- `/done` and `/cancel` for the active Reel item
+The token and paired account ID remain local. Never paste the BotFather token into a Codex conversation, issue, or commit.
 
-Natural-language follow-ups are attached to a previous thread only if there is exactly one completed recent task. Otherwise they start without mixing another task's context; use `/continue` when you want to name the target explicitly.
+## Use
 
-Register project directories locally before referencing them in WhatsApp. Paths must be inside your home folder and cannot point into private configuration directories:
+Open the private bot chat and send messages there. It cannot read your Telegram Saved Messages or act as your personal Telegram account. Telegram bots cannot start a chat, so you must open the chat and send `/start` once.
 
-```sh
-npm run gateway:ctl -- project add demo "$PWD"
-npm run gateway:ctl -- project list
-```
+Telegram pairing enables natural conversation by default: ordinary messages start read-only Codex tasks and follow-ups reuse the recent default conversation. A Reel link by itself is saved and acknowledged without starting an expensive task; text sent with the link starts a task. Send `/mode safe` to switch to note-only mode, or `/mode agent` to resume natural task handling.
 
-A `/project` task waits until you explicitly approve its task ID. Approval allows Codex to make requested changes only inside that registered project directory. Project tasks cannot access the network, install software, change global settings, commit or push, or publish externally. Each continuation of a project task also requires approval. Codex approval codes and task state can be reviewed in `npm run gateway:inbox`; the local CLI supports `approve <code>`, `deny <code>`, and `approve-task <task-id>`.
+Useful commands include:
 
-## WhatsApp replies
+- `/start`, `/help`, and `/status`
+- `/pause` and `/resume`
+- `/codex <request>`, `/research <request>`, and `/repo <request>`
+- `/project <alias> <request>` for a locally registered project
+- `/approve <code>` and `/deny <code>` for Codex permission requests
+- `/continue <task-id> <follow-up>`, `/stop <task-id>`, `/done`, and `/cancel`
 
-Outbound sending is disabled until its one-message test passes. Results remain in the local inbox. The extension checks the exact configured self-chat and an initially empty editable composer, types before it looks for an enabled send button, then verifies a new outgoing message with a new WhatsApp identity. It sends at most one message per minute and filters `Codex:` replies to prevent loops. A failure before clicking is marked failed; after clicking, an unverified delivery is marked uncertain and is never retried automatically.
+Register projects locally before using `/project`; each project task still requires explicit approval. Project paths must be under your home directory and cannot target private configuration folders.
 
-After the updated extension is loaded and the configured self-chat is selected, the one-shot test can be queued with:
+## Replies and testing
+
+Outbound replies stay local until a one-shot test succeeds. After the Telegram worker is running, run:
 
 ```sh
 npm run gateway:ctl -- outbound-test
 ```
 
-After you explicitly choose to run that command, it queues one harmless test message. It can only be claimed while the extension is open on the exact configured self-chat. A successful verified delivery enables concise task and status replies. The full report stays in the local task record. WhatsApp Web's page structure can change; a send that cannot be verified is marked uncertain and results continue to appear in the local inbox.
+That queues one harmless test message for the selected transport. Once Telegram confirms delivery, concise task status and result replies can be sent automatically to the paired private chat. Each send is rate-limited; an uncertain delivery is never retried automatically. Full reports remain in the local task record and inbox.
 
-**The updated extension and outbound send have not yet been live-tested in this Chrome session.** Reloading the extension is required after code changes. No message has been sent by this implementation.
-
-## Codex MCP
-
-The MCP server remains a separate, read-only interface for the local knowledge library. It exposes tools for Reel knowledge, saved notes, task listing, task details, and report search. Start it with:
+Useful local commands:
 
 ```sh
-npm run mcp
+npm run gateway:inbox
+npm run gateway:ctl -- status
+npm run gateway:ctl -- mode safe
+npm run gateway:startup -- status|start|stop|uninstall
+npm test
+npm run typecheck
 ```
 
-It does not read WhatsApp directly or run tasks. The gateway service owns task execution.
+The read-only MCP server is separate: run `npm run mcp`. It exposes the local knowledge library and does not read Telegram directly or execute tasks.
 
-## Operations and data
+## Operations and limits
 
-- Start/stop the full gateway: `npm run gateway` / `Ctrl+C`.
-- Install/status/start/stop automatic login startup: `npm run gateway:startup -- install|status|start|stop`.
-- Remove automatic login startup: `npm run gateway:startup -- uninstall`.
-- Start capture only: `npm run collector`.
-- View task results and approvals: `npm run gateway:inbox`.
-- Pause execution: `npm run gateway:ctl -- pause`.
-- Inspect task totals: `npm run gateway:ctl -- status`.
-- Change routing mode: `npm run gateway:ctl -- mode safe|agent`.
-- Sign in to the isolated Codex home: `npm run gateway:login`.
-- Check collector state: `npm run status`.
-- Check database integrity: `npm run db:check`.
-- Automated checks: `npm test` and `npm run typecheck`.
-- SQLite database: `~/Library/Application Support/ReelToCodex/knowledge.sqlite`.
-- Collector token: `~/Library/Application Support/ReelToCodex/collector-token`.
-
-The schema upgrades transactionally and keeps existing Reel, instruction, and findings data. A running task interrupted by a service restart is marked `needs_resume`; it is never silently replayed. Use `/resume <task-id>` after reviewing the local task status.
-
-## Limits and privacy
-
-- The gateway starts at macOS user login and restarts after unexpected exits. It cannot work while the Mac is asleep, shut down, or logged out. Chrome must also remain open and WhatsApp Web must be logged in. Automatic startup opens WhatsApp Web in Chrome at login; the extension selects the configured self-chat once per page start and reads messages only after confirming its exact title. Selecting another chat pauses observation before message nodes are queried and blocks outbound sends.
-- If the Mac sleeps, the gateway and Chrome stop polling. After wake, collection continues only when the browser is open, WhatsApp Web is logged in, and the exact self-chat is selected. If the last visible cursor has disappeared, collection stays paused until you review the chat and choose Rebaseline.
-- Earlier chat history is not imported. If the visible cursor disappears, collection pauses until rebaseline.
-- Website, Reel, and repository content are untrusted input. The gateway wraps source text as untrusted and never treats it as trusted system instructions.
-- Research tasks use a read-only named filesystem profile and have no shell network access; built-in Codex web research remains available. An explicitly approved project task may edit files only inside its registered project directory and also has no shell network access. Permission, network, root, and execution-policy widening requests are denied. File-change approval requests are shown only for paths verified inside the registered project.
-- A gateway task is a separate Codex App Server thread; it does not take over an arbitrary conversation already open in Codex Desktop.
-- Codex authentication and usage limits follow the locally signed-in Codex account. This project does not require a separate paid API key.
-- Only the read-only local knowledge MCP is configured for the gateway. The App Server effective MCP inventory is checked before a turn; an unexpected provider blocks the task and pauses the gateway.
-- The Chrome extension can technically read WhatsApp Web content while enabled. Its code checks the configured title before reading message nodes, and the collector stores message content only for the configured self-chat.
-- WhatsApp Web selectors are unofficial and may change. The sender fails closed if it cannot verify the composer, the configured chat, and a sent message.
+- The gateway runs while the Mac is awake, logged in, and the service is running. It cannot process requests while the Mac is shut down or asleep.
+- Telegram update delivery uses a durable offset. Ingested messages are deduplicated by a stable hash of Telegram chat and message IDs, including after restarts.
+- The Bot API update queue is retained for up to 24 hours. Keep the Mac available for requests that need prompt handling.
+- Gateway task data and the Telegram token are stored locally under `~/Library/Application Support/ReelToCodex`; private files use owner-only permissions.
+- Website, Reel, and repository content are untrusted input. The gateway does not treat instructions embedded in those sources as trusted rules.
+- Research tasks are read-only. Project tasks can write only inside a registered project, require approval, and run without network access.
+- Codex authentication and usage limits follow the locally signed-in Codex account. No separate model API key is required.

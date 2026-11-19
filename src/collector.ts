@@ -1,6 +1,6 @@
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import { readFile } from 'node:fs/promises';
-import { TOKEN_PATH, SELF_CHAT_TITLE, EXTENSION_ID } from './paths.js';
+import { TOKEN_PATH, SELF_CHAT_TITLE, TELEGRAM_CHAT_TITLE, EXTENSION_ID, type TransportKind } from './paths.js';
 import { openLibrary } from './library.js';
 
 const PORT = Number(process.env.REEL_TO_CODEX_PORT ?? 8787);
@@ -123,7 +123,9 @@ const server = createServer(async (req, res) => {
     }
     if (req.method === 'POST' && req.url === '/v1/events') {
       const body = await readJson(req);
-      if (body.chatTitle !== SELF_CHAT_TITLE || typeof body.messageKey !== 'string' || typeof body.text !== 'string') {
+      const transport: TransportKind = body.transport === 'telegram' ? 'telegram' : 'whatsapp';
+      const expectedChat = transport === 'telegram' ? TELEGRAM_CHAT_TITLE : SELF_CHAT_TITLE;
+      if (body.chatTitle !== expectedChat || typeof body.messageKey !== 'string' || typeof body.text !== 'string') {
         send(res, 400, { error: 'invalid_event' }, origin);
         return;
       }
@@ -131,6 +133,7 @@ const server = createServer(async (req, res) => {
         chatTitle: body.chatTitle,
         messageKey: body.messageKey,
         text: body.text,
+        transport,
         ...(typeof body.observedAt === 'string' ? { observedAt: body.observedAt } : {}),
       });
       send(res, 200, { ok: true, ...result }, origin);
@@ -138,17 +141,21 @@ const server = createServer(async (req, res) => {
     }
     if (req.method === 'POST' && req.url === '/v1/outbox/claim') {
       const body = await readJson(req);
-      if (body.chatTitle !== SELF_CHAT_TITLE) {
+      const transport: TransportKind = body.transport === 'telegram' ? 'telegram' : 'whatsapp';
+      const expectedChat = transport === 'telegram' ? TELEGRAM_CHAT_TITLE : SELF_CHAT_TITLE;
+      if (body.chatTitle !== expectedChat) {
         send(res, 400, { error: 'invalid_outbound_request' }, origin);
         return;
       }
-      const item = library.claimNextOutbound(SELF_CHAT_TITLE);
+      const item = library.claimNextOutbound(expectedChat, transport);
       send(res, 200, { ok: true, item }, origin);
       return;
     }
     if (req.method === 'POST' && req.url === '/v1/outbox/sent') {
       const body = await readJson(req);
-      if (body.chatTitle !== SELF_CHAT_TITLE || typeof body.outboxId !== 'string' || typeof body.messageKey !== 'string') {
+      const transport: TransportKind = body.transport === 'telegram' ? 'telegram' : 'whatsapp';
+      const expectedChat = transport === 'telegram' ? TELEGRAM_CHAT_TITLE : SELF_CHAT_TITLE;
+      if (body.chatTitle !== expectedChat || typeof body.outboxId !== 'string' || typeof body.messageKey !== 'string') {
         send(res, 400, { error: 'invalid_outbound_result' }, origin);
         return;
       }
@@ -158,7 +165,9 @@ const server = createServer(async (req, res) => {
     }
     if (req.method === 'POST' && req.url === '/v1/outbox/failed') {
       const body = await readJson(req);
-      if (body.chatTitle !== SELF_CHAT_TITLE || typeof body.outboxId !== 'string') {
+      const transport: TransportKind = body.transport === 'telegram' ? 'telegram' : 'whatsapp';
+      const expectedChat = transport === 'telegram' ? TELEGRAM_CHAT_TITLE : SELF_CHAT_TITLE;
+      if (body.chatTitle !== expectedChat || typeof body.outboxId !== 'string') {
         send(res, 400, { error: 'invalid_outbound_result' }, origin);
         return;
       }
@@ -168,7 +177,9 @@ const server = createServer(async (req, res) => {
     }
     if (req.method === 'POST' && req.url === '/v1/outbox/uncertain') {
       const body = await readJson(req);
-      if (body.chatTitle !== SELF_CHAT_TITLE || typeof body.outboxId !== 'string') {
+      const transport: TransportKind = body.transport === 'telegram' ? 'telegram' : 'whatsapp';
+      const expectedChat = transport === 'telegram' ? TELEGRAM_CHAT_TITLE : SELF_CHAT_TITLE;
+      if (body.chatTitle !== expectedChat || typeof body.outboxId !== 'string') {
         send(res, 400, { error: 'invalid_outbound_result' }, origin);
         return;
       }

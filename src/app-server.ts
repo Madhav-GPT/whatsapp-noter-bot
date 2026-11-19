@@ -51,7 +51,7 @@ export class CodexAppServerClient extends EventEmitter {
     });
     try {
       await this.request('initialize', {
-        clientInfo: { name: 'whatsapp-noter-bot', title: 'WhatsApp to Codex Gateway', version: '0.2.0' },
+        clientInfo: { name: 'personal-codex-gateway', title: 'Personal Codex Gateway', version: '0.3.0' },
         // Named permission profiles and runtime workspace roots are currently part of
         // the installed App Server's experimental capability surface.
         capabilities: { experimentalApi: true },

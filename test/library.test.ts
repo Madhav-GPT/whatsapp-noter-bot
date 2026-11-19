@@ -13,7 +13,7 @@ const link = 'https://www.instagram.com/reel/ORCH_123/?igsh=tracking';
 test('stores a Reel and consecutive exact instructions, then exposes FTS search', () => {
   const library = new KnowledgeLibrary(':memory:');
   library.setAgentChatMode(true);
-  const reel = library.ingest({ chatTitle: SELF_CHAT_TITLE, messageKey: messageKey('reel-1'), text: `Save ${link}`, observedAt: '2026-11-16T10:00:00Z' });
+  const reel = library.ingest({ chatTitle: SELF_CHAT_TITLE, messageKey: messageKey('reel-1'), text: link, observedAt: '2026-11-16T10:00:00Z' });
   assert.equal(reel.kind, 'reel');
   assert.equal(reel.itemIds.length, 1);
   const id = reel.itemIds[0]!;
@@ -61,7 +61,7 @@ test('deduplicates across process restarts and records migration version', async
     const reopened = new KnowledgeLibrary(path);
     assert.equal(reopened.ingest({ chatTitle: SELF_CHAT_TITLE, messageKey: key, text: link }).duplicate, true);
     assert.equal((reopened.db.prepare('SELECT count(*) AS n FROM source_items').get() as { n: number }).n, 1);
-    assert.deepEqual(reopened.db.prepare('SELECT version FROM schema_migrations ORDER BY version').all(), [{ version: 1 }, { version: 2 }, { version: 3 }, { version: 4 }]);
+    assert.deepEqual(reopened.db.prepare('SELECT version FROM schema_migrations ORDER BY version').all(), [{ version: 1 }, { version: 2 }, { version: 3 }, { version: 4 }, { version: 5 }]);
     assert.deepEqual(reopened.db.pragma('integrity_check'), [{ integrity_check: 'ok' }]);
     reopened.close();
   } finally {
@@ -157,6 +157,49 @@ test('an explicit Reel research command saves the Reel and associates it with on
   assert.ok(accepted.taskId);
   assert.equal((library.db.prepare('SELECT source_item_id AS sourceItemId FROM gateway_tasks WHERE id=?').get(accepted.taskId!) as { sourceItemId: string }).sourceItemId, accepted.itemIds[0]);
   assert.equal(library.getItem(accepted.itemIds[0]!)?.originalUrl, reelUrl);
+  library.close();
+});
+
+test('natural Telegram messages start read-only tasks, acknowledge Reel-only links, and reuse the recent conversation', () => {
+  const library = new KnowledgeLibrary(':memory:');
+  library.setAgentChatMode(true);
+  const reelUrl = 'https://www.instagram.com/reel/NATURAL_1/';
+  const reel = library.ingest({
+    chatTitle: 'Telegram Bot (Private)',
+    transport: 'telegram',
+    messageKey: messageKey('telegram-reel-only'),
+    text: reelUrl,
+    observedAt: '2026-11-16T10:00:00Z',
+  });
+  assert.equal(reel.kind, 'reel');
+  assert.equal(reel.taskId, undefined);
+
+  const request = library.ingest({
+    chatTitle: 'Telegram Bot (Private)',
+    transport: 'telegram',
+    messageKey: messageKey('telegram-reel-request'),
+    text: `Check what is there ${reelUrl}`,
+    observedAt: '2026-11-16T10:01:00Z',
+  });
+  assert.equal(request.kind, 'task');
+  assert.ok(request.taskId);
+  const claimed = library.claimNextTask()!;
+  assert.equal(claimed.id, request.taskId);
+  library.setTaskThread(claimed.id, 'telegram-default-thread');
+  library.finishTask(claimed.id, 'completed', 'Reel review complete.');
+
+  const followup = library.ingest({
+    chatTitle: 'Telegram Bot (Private)',
+    transport: 'telegram',
+    messageKey: messageKey('telegram-natural-followup'),
+    text: 'Tell me more about that technique.',
+    observedAt: '2026-11-16T10:02:00Z',
+  });
+  assert.equal(followup.kind, 'task');
+  assert.equal(library.getTask(followup.taskId!)?.threadId, 'telegram-default-thread');
+  const outbox = library.getOutbox() as Array<{ body: string; transport: string }>;
+  assert.ok(outbox.some(({ body, transport }) => transport === 'telegram' && body.includes('Reel link received and saved.')));
+  assert.ok(outbox.some(({ body, transport }) => transport === 'telegram' && body.includes('Received · Task #')));
   library.close();
 });
 

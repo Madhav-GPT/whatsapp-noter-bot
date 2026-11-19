@@ -1,14 +1,14 @@
-import { chmod, lstat, mkdir, rename, unlink, writeFile } from 'node:fs/promises';
+import { access, chmod, lstat, mkdir, rename, unlink, writeFile } from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
 import { basename, dirname, join } from 'node:path';
 import { homedir } from 'node:os';
 import { fileURLToPath } from 'node:url';
-import { DATA_DIR, SELF_CHAT_TITLE } from './paths.js';
+import { DATA_DIR, TELEGRAM_OWNER_PATH, TELEGRAM_TOKEN_PATH } from './paths.js';
 import { resolveCodexExecutable } from './codex-home.js';
 
 const GATEWAY_LABEL = 'com.madhav.reeltocodex.gateway';
-const WHATSAPP_LABEL = 'com.madhav.reeltocodex.whatsapp';
+const LEGACY_WHATSAPP_LABEL = 'com.madhav.reeltocodex.whatsapp';
 const home = homedir();
 const uid = typeof process.getuid === 'function' ? process.getuid() : null;
 const domain = uid === null ? null : `gui/${uid}`;
@@ -78,7 +78,7 @@ async function install(): Promise<void> {
     throw new Error(`Refusing to write gateway logs to an unexpected directory at ${logs}.`);
   }
   await chmod(logs, 0o700);
-  for (const name of ['gateway.log', 'gateway-error.log', 'whatsapp-open.log', 'whatsapp-open-error.log']) {
+  for (const name of ['gateway.log', 'gateway-error.log']) {
     const path = join(logs, name);
     try {
       const existing = await lstat(path);
@@ -99,31 +99,50 @@ async function install(): Promise<void> {
     PATH: launchPath,
     CODEX_BIN: codexExecutable,
     REEL_TO_CODEX_DATA_DIR: DATA_DIR,
+    REEL_TO_CODEX_TRANSPORT: 'telegram',
   };
   if (process.env.LANG) environment.LANG = process.env.LANG;
   const envXml = Object.entries(environment).map(([key, value]) => `    <key>${xml(key)}</key>${stringElement(value)}`).join('\n');
   const gateway = plist(GATEWAY_LABEL, [nodeExecutable, tsxEntry, serviceEntry], `  <key>WorkingDirectory</key>${stringElement(repoRoot)}\n  <key>RunAtLoad</key><true/>\n  <key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>\n  <key>ThrottleInterval</key><integer>30</integer>\n  <key>ProcessType</key>${stringElement('Background')}\n  <key>EnvironmentVariables</key><dict>\n${envXml}\n  </dict>\n  <key>StandardOutPath</key>${stringElement(join(logs, 'gateway.log'))}\n  <key>StandardErrorPath</key>${stringElement(join(logs, 'gateway-error.log'))}`);
-  const browser = plist(WHATSAPP_LABEL, ['/usr/bin/open', '-a', 'Google Chrome', 'https://web.whatsapp.com/'], `  <key>RunAtLoad</key><true/>\n  <key>StandardOutPath</key>${stringElement(join(logs, 'whatsapp-open.log'))}\n  <key>StandardErrorPath</key>${stringElement(join(logs, 'whatsapp-open-error.log'))}`);
+  const telegramFilesPresent = await Promise.all([TELEGRAM_TOKEN_PATH, TELEGRAM_OWNER_PATH].map((path) => access(path).then(() => true, () => false)));
+  if (!telegramFilesPresent.every(Boolean)) throw new Error('Configure and pair the Telegram bot before replacing the current startup service.');
 
   await writeAgent(GATEWAY_LABEL, gateway);
-  await writeAgent(WHATSAPP_LABEL, browser);
-  for (const label of [GATEWAY_LABEL, WHATSAPP_LABEL]) {
-    const path = agentPath(label);
-    launchctl(['bootout', domain, path], true);
-    launchctl(['enable', `${domain}/${label}`]);
-    launchctl(['bootstrap', domain, path]);
+  await disableLegacyWhatsAppAgent();
+  const path = agentPath(GATEWAY_LABEL);
+  launchctl(['bootout', domain, path], true);
+  launchctl(['enable', `${domain}/${GATEWAY_LABEL}`]);
+  launchctl(['bootstrap', domain, path]);
+  process.stdout.write(`Installed and started the per-user Telegram gateway.\nGateway logs: ${logs}/gateway-error.log\nNo browser session is required.\n`);
+}
+
+async function disableLegacyWhatsAppAgent(): Promise<void> {
+  if (!domain) throw new Error('Could not identify the current macOS user session.');
+  const path = agentPath(LEGACY_WHATSAPP_LABEL);
+  launchctl(['bootout', domain, path], true);
+  launchctl(['disable', `${domain}/${LEGACY_WHATSAPP_LABEL}`], true);
+  try {
+    const existing = await lstat(path);
+    if (!existing.isFile() || existing.isSymbolicLink() || (typeof process.getuid === 'function' && existing.uid !== process.getuid())) {
+      throw new Error(`Refusing to remove an unexpected startup file at ${path}.`);
+    }
+    await unlink(path);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
   }
-  process.stdout.write(`Installed and started per-user background services.\nGateway logs: ${logs}/gateway-error.log\nWhatsApp Web opens in Chrome at login; collection runs only while “${SELF_CHAT_TITLE}” is selected.\n`);
 }
 
 async function stop(): Promise<void> {
   if (!domain) throw new Error('Could not identify the current macOS user session.');
   launchctl(['bootout', domain, agentPath(GATEWAY_LABEL)], true);
-  process.stdout.write('Gateway service stopped. WhatsApp Web can remain open in Chrome.\n');
+  process.stdout.write('Gateway service stopped.\n');
 }
 
 async function start(): Promise<void> {
   if (!domain) throw new Error('Could not identify the current macOS user session.');
+  const telegramFilesPresent = await Promise.all([TELEGRAM_TOKEN_PATH, TELEGRAM_OWNER_PATH].map((candidate) => access(candidate).then(() => true, () => false)));
+  if (!telegramFilesPresent.every(Boolean)) throw new Error('Configure and pair the Telegram bot before starting the migrated gateway.');
+  await disableLegacyWhatsAppAgent();
   const path = agentPath(GATEWAY_LABEL);
   launchctl(['bootout', domain, path], true);
   launchctl(['enable', `${domain}/${GATEWAY_LABEL}`]);
@@ -133,22 +152,18 @@ async function start(): Promise<void> {
 
 async function status(): Promise<void> {
   if (!domain) throw new Error('Could not identify the current macOS user session.');
-  for (const [label, description] of [[GATEWAY_LABEL, 'Gateway'], [WHATSAPP_LABEL, 'WhatsApp Web at login']] as const) {
-    const result = launchctl(['print', `${domain}/${label}`], true);
-    const state = result === null ? 'not loaded' : label === WHATSAPP_LABEL
-      ? 'installed (opens Chrome at login; this one-shot job exits after opening)'
-      : result.trim().split('\n').slice(0, 6).join('\n');
-    process.stdout.write(`${description}: ${state}\n`);
-  }
+  const result = launchctl(['print', `${domain}/${GATEWAY_LABEL}`], true);
+  process.stdout.write(`Gateway: ${result === null ? 'not loaded' : result.trim().split('\n').slice(0, 6).join('\n')}\n`);
+  const legacy = launchctl(['print', `${domain}/${LEGACY_WHATSAPP_LABEL}`], true);
+  process.stdout.write(`Legacy WhatsApp browser opener: ${legacy === null ? 'not loaded' : 'still loaded; Telegram install will remove it'}\n`);
 }
 
 async function uninstall(): Promise<void> {
   if (!domain) throw new Error('Could not identify the current macOS user session.');
-  for (const label of [GATEWAY_LABEL, WHATSAPP_LABEL]) {
-    launchctl(['bootout', domain, agentPath(label)], true);
-    launchctl(['disable', `${domain}/${label}`], true);
-    await unlink(agentPath(label)).catch((error: NodeJS.ErrnoException) => { if (error.code !== 'ENOENT') throw error; });
-  }
+  launchctl(['bootout', domain, agentPath(GATEWAY_LABEL)], true);
+  launchctl(['disable', `${domain}/${GATEWAY_LABEL}`], true);
+  await unlink(agentPath(GATEWAY_LABEL)).catch((error: NodeJS.ErrnoException) => { if (error.code !== 'ENOENT') throw error; });
+  await disableLegacyWhatsAppAgent();
   process.stdout.write('Automatic startup removed. Your project, database, and Codex sign-in are unchanged.\n');
 }
 

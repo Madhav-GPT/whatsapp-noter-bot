@@ -1,9 +1,9 @@
 {
-  "name": "whatsapp-noter-bot",
+  "name": "personal-codex-gateway",
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "Local-first WhatsApp Message Yourself gateway to Codex App Server with SQLite and MCP",
+  "description": "Local-first Telegram Bot API gateway to Codex App Server with SQLite and MCP",
   "scripts": {
     "setup": "tsx src/setup.ts",
     "collector": "tsx src/collector.ts",
@@ -11,6 +11,9 @@
     "gateway:startup": "tsx src/gateway-startup.ts",
     "gateway:login": "tsx src/gateway-login.ts",
     "gateway:ctl": "tsx src/gateway-cli.ts",
+    "telegram:configure": "tsx src/telegram/configure.ts",
+    "telegram:pair": "tsx src/telegram/pair.ts",
+    "telegram:status": "tsx src/telegram/status.ts",
     "gateway:inbox": "tsx src/gateway-cli.ts inbox",
     "gateway:project": "tsx src/gateway-cli.ts project",
     "mcp": "tsx src/mcp.ts",

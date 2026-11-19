@@ -56,7 +56,7 @@ try {
     process.stdout.write(`Project task ${id} approved and queued with write access limited to its registered project directory.\n`);
   } else if (command === 'outbound-test') {
     const id = library.createOutboundTest();
-    process.stdout.write(`Queued one harmless outbound test (${id.slice(0, 8)}). It sends only if the extension is open on the configured self-chat.\n`);
+    process.stdout.write(`Queued one harmless outbound test (${id.slice(0, 8)}) for the configured transport.\n`);
   } else if (command === 'project' && args[0] === 'add') {
     const [, alias, requestedPath] = args;
     if (!alias || !requestedPath || !/^[a-z][a-z0-9_-]{0,30}$/.test(alias)) throw new Error('Usage: npm run gateway:ctl -- project add <alias> <directory>');

@@ -1,14 +1,15 @@
 import Database from 'better-sqlite3';
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
-import { dirname } from 'node:path';
-import { mkdir, chmod } from 'node:fs/promises';
-import { DATABASE_PATH, DATA_DIR, SELF_CHAT_TITLE } from './paths.js';
+import { basename, dirname, join } from 'node:path';
+import { access, mkdir, chmod } from 'node:fs/promises';
+import { ACTIVE_TRANSPORT, DATABASE_PATH, DATA_DIR, SELF_CHAT_TITLE, TELEGRAM_CHAT_TITLE, type TransportKind } from './paths.js';
 import { extractReelLinks, isInstructionCommand } from './reels.js';
 
 export interface InboundMessage {
   chatTitle: string;
   messageKey: string;
   text: string;
+  transport?: TransportKind;
   observedAt?: string;
 }
 
@@ -18,6 +19,7 @@ export interface GatewayTask {
   id: string;
   requestText: string;
   status: GatewayTaskStatus;
+  transport: TransportKind;
   threadId: string | null;
   turnId: string | null;
   intent: string;
@@ -39,6 +41,7 @@ export interface LibraryStatus {
 
 export class KnowledgeLibrary {
   readonly db: Database.Database;
+  private activeTransport: TransportKind = ACTIVE_TRANSPORT;
 
   constructor(path = DATABASE_PATH) {
     this.db = new Database(path);
@@ -223,6 +226,16 @@ export class KnowledgeLibrary {
       }
       this.db.exec("INSERT OR IGNORE INTO settings(key,value) VALUES('gateway_mode','safe')");
       this.db.exec("INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (4, datetime('now'))");
+
+      const taskColumnsV5 = this.db.pragma('table_info(gateway_tasks)') as Array<{ name: string }>;
+      if (!taskColumnsV5.some((column) => column.name === 'transport')) {
+        this.db.exec("ALTER TABLE gateway_tasks ADD COLUMN transport TEXT NOT NULL DEFAULT 'whatsapp' CHECK(transport IN ('whatsapp','telegram'))");
+      }
+      const outboxColumnsV5 = this.db.pragma('table_info(gateway_outbox)') as Array<{ name: string }>;
+      if (!outboxColumnsV5.some((column) => column.name === 'delivery_transport')) {
+        this.db.exec("ALTER TABLE gateway_outbox ADD COLUMN delivery_transport TEXT NOT NULL DEFAULT 'whatsapp' CHECK(delivery_transport IN ('whatsapp','telegram'))");
+      }
+      this.db.exec("INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (5, datetime('now'))");
       this.db.exec('COMMIT');
     } catch (error) {
       this.db.exec('ROLLBACK');
@@ -255,7 +268,9 @@ export class KnowledgeLibrary {
   }
 
   ingest(message: InboundMessage): { duplicate: boolean; kind: 'reel' | 'instruction' | 'note' | 'task' | 'command' | 'ignored'; itemIds: string[]; taskId?: string; cursor: string } {
-    if (message.chatTitle !== SELF_CHAT_TITLE) throw new Error('Self-chat title did not match the configured title.');
+    const transport = message.transport ?? 'whatsapp';
+    const expectedChatTitle = transport === 'telegram' ? TELEGRAM_CHAT_TITLE : SELF_CHAT_TITLE;
+    if (message.chatTitle !== expectedChatTitle) throw new Error('Private input chat did not match the configured transport.');
     if (!/^[A-Za-z0-9_-]{43}$/.test(message.messageKey)) throw new Error('Invalid message key hash.');
     if (message.text.length > 10000) throw new Error('Message exceeds the allowed length.');
 
@@ -264,95 +279,107 @@ export class KnowledgeLibrary {
       : new Date().toISOString();
     const links = extractReelLinks(message.text);
 
-    return this.db.transaction(() => {
-      const prior = this.db.prepare('SELECT 1 FROM source_events WHERE message_key=?').get(message.messageKey);
-      if (prior) {
-        this.updateCursor(message.messageKey, receivedAt);
-        return { duplicate: true, kind: 'ignored' as const, itemIds: [], cursor: message.messageKey };
-      }
-      if (this.db.prepare('SELECT 1 FROM gateway_outbox WHERE sent_message_key=?').get(message.messageKey)) {
-        this.updateCursor(message.messageKey, receivedAt);
-        return { duplicate: true, kind: 'ignored' as const, itemIds: [], cursor: message.messageKey };
-      }
-      if (/^(?:🤖\s*)?Codex:/i.test(message.text.trim())) {
-        this.updateCursor(message.messageKey, receivedAt);
-        return { duplicate: true, kind: 'ignored' as const, itemIds: [], cursor: message.messageKey };
-      }
+    const previousTransport = this.activeTransport;
+    this.activeTransport = transport;
+    try {
+      return this.db.transaction(() => {
+        const prior = this.db.prepare('SELECT 1 FROM source_events WHERE message_key=?').get(message.messageKey);
+        if (prior) {
+          this.updateCursor(message.messageKey, receivedAt);
+          return { duplicate: true, kind: 'ignored' as const, itemIds: [], cursor: message.messageKey };
+        }
+        if (this.db.prepare('SELECT 1 FROM gateway_outbox WHERE sent_message_key=?').get(message.messageKey)) {
+          this.updateCursor(message.messageKey, receivedAt);
+          return { duplicate: true, kind: 'ignored' as const, itemIds: [], cursor: message.messageKey };
+        }
+        if (/^(?:🤖\s*)?Codex:/i.test(message.text.trim())) {
+          this.updateCursor(message.messageKey, receivedAt);
+          return { duplicate: true, kind: 'ignored' as const, itemIds: [], cursor: message.messageKey };
+        }
 
-      let kind: 'reel' | 'instruction' | 'note' | 'task' | 'command' | 'ignored' = 'ignored';
-      const itemIds: string[] = [];
-      let taskId: string | undefined;
-      const explicitCommand = message.text.trim().startsWith('/') && !/^\/(?:done|cancel)(?:\s|$)/i.test(message.text.trim());
-      if (explicitCommand && links.length === 0) {
-        this.handleGatewayCommand(message.text, message.messageKey, receivedAt);
-        kind = 'command';
-        const created = this.db.prepare('SELECT id FROM gateway_tasks WHERE source_message_key=?').get(message.messageKey) as { id: string } | undefined;
-        if (created) taskId = created.id;
-      } else if (links.length > 0) {
-        kind = 'reel';
-        const now = receivedAt;
-        const create = this.db.prepare(`INSERT OR IGNORE INTO source_items
-          (id, original_url, canonical_url, shortcode, original_message, source_message_key, received_at, created_at, updated_at)
-          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`);
-        for (const link of links) {
-          const existing = this.db.prepare('SELECT id FROM source_items WHERE source_message_key=? AND canonical_url=?').get(message.messageKey, link.canonicalUrl) as { id: string } | undefined;
-          const id = existing?.id ?? crypto.randomUUID();
-          create.run(id, link.originalUrl, link.canonicalUrl, link.shortcode, message.text, message.messageKey, receivedAt, now, now);
-          itemIds.push(id);
-          this.indexItem(id, `${link.originalUrl}\n${message.text}`);
-        }
-        const urls = message.text.match(/https?:\/\/[^\s]+/gi) ?? [];
-        const hasNonReelUrl = urls.some((url) => extractReelLinks(url).length === 0);
-        if (!explicitCommand && this.isAgentChatMode() && (hasNonReelUrl || /\b(research|analy[sz]e|summari[sz]e|compare|explain|find|review|prepare|draft|investigate)\b/i.test(message.text))) {
-          kind = 'task';
-          taskId = this.createTask(message.messageKey, message.text, receivedAt, itemIds.length === 1 ? itemIds[0] ?? null : null);
-        }
-        this.setActive(itemIds.length === 1 ? itemIds[0] ?? null : null);
-        if (explicitCommand) {
-          this.handleGatewayCommand(message.text, message.messageKey, receivedAt, itemIds.length === 1 ? itemIds[0] : undefined);
+        let kind: 'reel' | 'instruction' | 'note' | 'task' | 'command' | 'ignored' = 'ignored';
+        const itemIds: string[] = [];
+        let taskId: string | undefined;
+        const explicitCommand = message.text.trim().startsWith('/') && !/^\/(?:done|cancel)(?:\s|$)/i.test(message.text.trim());
+        if (explicitCommand && links.length === 0) {
+          this.handleGatewayCommand(message.text, message.messageKey, receivedAt);
           kind = 'command';
           const created = this.db.prepare('SELECT id FROM gateway_tasks WHERE source_message_key=?').get(message.messageKey) as { id: string } | undefined;
           if (created) taskId = created.id;
-        }
-      } else {
-        const command = isInstructionCommand(message.text);
-        const activeId = this.getActiveItem(receivedAt);
-        if (command && activeId) {
-          kind = 'command';
-          const status = command === 'done' ? 'done' : 'cancelled';
-          this.db.prepare('UPDATE source_items SET status=?, updated_at=? WHERE id=?').run(status, receivedAt, activeId);
-          this.setActive(null);
-          itemIds.push(activeId);
-        } else if (message.text.trim() && activeId) {
-          kind = 'instruction';
-          this.db.prepare('INSERT INTO instructions(item_id, message_key, content, received_at) VALUES (?, ?, ?, ?)')
-            .run(activeId, message.messageKey, message.text, receivedAt);
-          this.db.prepare('UPDATE source_items SET updated_at=? WHERE id=?').run(receivedAt, activeId);
-          this.indexItem(activeId, message.text);
-          itemIds.push(activeId);
-          if (this.isAgentChatMode()) {
-            kind = 'task';
-            taskId = this.createTask(message.messageKey, message.text, receivedAt, activeId, this.findContinuationTarget(message.text, receivedAt));
+        } else if (links.length > 0) {
+          kind = 'reel';
+          const now = receivedAt;
+          const create = this.db.prepare(`INSERT OR IGNORE INTO source_items
+            (id, original_url, canonical_url, shortcode, original_message, source_message_key, received_at, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`);
+          for (const link of links) {
+            const existing = this.db.prepare('SELECT id FROM source_items WHERE source_message_key=? AND canonical_url=?').get(message.messageKey, link.canonicalUrl) as { id: string } | undefined;
+            const id = existing?.id ?? crypto.randomUUID();
+            create.run(id, link.originalUrl, link.canonicalUrl, link.shortcode, message.text, message.messageKey, receivedAt, now, now);
+            itemIds.push(id);
+            this.indexItem(id, `${link.originalUrl}\n${message.text}`);
           }
-        } else if (message.text.trim()) {
-          if (this.isAgentChatMode()) {
+          const urls = message.text.match(/https?:\/\/[^\s]+/gi) ?? [];
+          const hasNonReelUrl = urls.some((url) => extractReelLinks(url).length === 0);
+          const hasRequestText = message.text.replace(/https?:\/\/[^\s]+/gi, '').replace(/[^\p{L}\p{N}]+/gu, '').length > 0;
+          if (!explicitCommand && this.isAgentChatMode() && (hasNonReelUrl || hasRequestText)) {
             kind = 'task';
-            taskId = this.createTask(message.messageKey, message.text, receivedAt, null, this.findContinuationTarget(message.text, receivedAt));
-          } else {
-            this.saveNote(message.messageKey, message.text, receivedAt);
-            kind = 'note';
-            this.queueOutbox(null, 'Saved as a note. Use /codex <request> or /research <request> to ask Codex.', receivedAt);
+            taskId = this.createTask(message.messageKey, message.text, receivedAt, itemIds.length === 1 ? itemIds[0] ?? null : null);
+            this.queueOutbox(taskId, `Received · Task #${taskId.slice(0, 8)} queued.`, receivedAt);
+          } else if (!explicitCommand && this.isAgentChatMode()) {
+            this.queueOutbox(null, 'Reel link received and saved. Send a follow-up when you want Codex to research or discuss it.', receivedAt);
+          }
+          this.setActive(itemIds.length === 1 ? itemIds[0] ?? null : null);
+          if (explicitCommand) {
+            this.handleGatewayCommand(message.text, message.messageKey, receivedAt, itemIds.length === 1 ? itemIds[0] : undefined);
+            kind = 'command';
+            const created = this.db.prepare('SELECT id FROM gateway_tasks WHERE source_message_key=?').get(message.messageKey) as { id: string } | undefined;
+            if (created) taskId = created.id;
+          }
+        } else {
+          const command = isInstructionCommand(message.text);
+          const activeId = this.getActiveItem(receivedAt);
+          if (command && activeId) {
+            kind = 'command';
+            const status = command === 'done' ? 'done' : 'cancelled';
+            this.db.prepare('UPDATE source_items SET status=?, updated_at=? WHERE id=?').run(status, receivedAt, activeId);
+            this.setActive(null);
+            itemIds.push(activeId);
+          } else if (message.text.trim() && activeId) {
+            kind = 'instruction';
+            this.db.prepare('INSERT INTO instructions(item_id, message_key, content, received_at) VALUES (?, ?, ?, ?)')
+              .run(activeId, message.messageKey, message.text, receivedAt);
+            this.db.prepare('UPDATE source_items SET updated_at=? WHERE id=?').run(receivedAt, activeId);
+            this.indexItem(activeId, message.text);
+            itemIds.push(activeId);
+            if (this.isAgentChatMode()) {
+              kind = 'task';
+              taskId = this.createTask(message.messageKey, message.text, receivedAt, activeId, this.findDefaultConversationTask(receivedAt));
+              this.queueOutbox(taskId, `Received · Task #${taskId.slice(0, 8)} queued.`, receivedAt);
+            }
+          } else if (message.text.trim()) {
+            if (this.isAgentChatMode()) {
+              kind = 'task';
+              taskId = this.createTask(message.messageKey, message.text, receivedAt, null, this.findDefaultConversationTask(receivedAt));
+              this.queueOutbox(taskId, `Received · Task #${taskId.slice(0, 8)} queued.`, receivedAt);
+            } else {
+              this.saveNote(message.messageKey, message.text, receivedAt);
+              kind = 'note';
+              this.queueOutbox(null, 'Saved as a note. Use /codex <request> or /research <request> to ask Codex.', receivedAt);
+            }
           }
         }
-      }
 
-      if (kind !== 'ignored') {
-        this.db.prepare('INSERT INTO source_events(message_key, event_kind, item_id, received_at) VALUES (?, ?, ?, ?)')
-          .run(message.messageKey, kind, itemIds[0] ?? null, receivedAt);
-      }
-      this.updateCursor(message.messageKey, receivedAt);
-      return { duplicate: false, kind, itemIds, ...(taskId ? { taskId } : {}), cursor: message.messageKey };
-    })();
+        if (kind !== 'ignored') {
+          this.db.prepare('INSERT INTO source_events(message_key, event_kind, item_id, received_at) VALUES (?, ?, ?, ?)')
+            .run(message.messageKey, kind, itemIds[0] ?? null, receivedAt);
+        }
+        this.updateCursor(message.messageKey, receivedAt);
+        return { duplicate: false, kind, itemIds, ...(taskId ? { taskId } : {}), cursor: message.messageKey };
+      })();
+    } finally {
+      this.activeTransport = previousTransport;
+    }
   }
 
   private handleGatewayCommand(text: string, sourceKey: string, at: string, sourceItemId?: string): boolean {
@@ -361,6 +388,10 @@ export class KnowledgeLibrary {
     const [command, ...args] = trimmed.split(/\s+/);
     const taskId = args[0] ?? '';
     if (command === '/done' || command === '/cancel') return false;
+    if (command === '/start') {
+      this.queueOutbox(null, 'This private Telegram chat is connected to your local Codex gateway. Send a request or /help to see controls.', at);
+      return true;
+    }
     if (command === '/help') {
       this.queueOutbox(null, 'Commands: /help, /status, /pause, /resume, /stop <task-id>, /continue <task-id> <follow-up>, /codex <request>, /research <request>, /repo <request>, /project <alias> <request>, /mode safe|agent, /approve <code>, /deny <code>. Plain messages are saved as notes in safe mode. Results: npm run gateway:inbox.', at);
       return true;
@@ -445,19 +476,20 @@ export class KnowledgeLibrary {
 
   private createTask(sourceKey: string, text: string, at = new Date().toISOString(), sourceItemId: string | null = null, continuationOf?: string, projectAlias?: string): string {
     const id = randomUUID();
-    const requestText = continuationOf ? `Continue task ${continuationOf}. Prior context: continue the same investigation and use the earlier findings.\n\nFollow-up: ${text}` : text;
+    const conversationTask = continuationOf ?? (projectAlias ? undefined : this.findDefaultConversationTask(at));
+    const requestText = conversationTask ? `Continue task ${conversationTask}. Use the earlier conversation as context, verify claims when needed, and answer the new request.\n\nFollow-up: ${text}` : text;
     const inheritedProject = projectAlias ? null : continuationOf
-      ? this.db.prepare('SELECT project_alias AS projectAlias FROM gateway_tasks WHERE id=?').get(continuationOf) as { projectAlias: string | null } | undefined
+      ? this.db.prepare('SELECT project_alias AS projectAlias FROM gateway_tasks WHERE id=?').get(conversationTask) as { projectAlias: string | null } | undefined
       : undefined;
     const scopedProjectAlias = projectAlias ?? inheritedProject?.projectAlias ?? undefined;
     const intent = scopedProjectAlias ? `project:${scopedProjectAlias}` : /https?:\/\/github\.com\//i.test(text) ? 'repository' : /https?:\/\//i.test(text) || /\b(research|investigate|compare|pricing|technical report|source attribution)\b/i.test(text) ? 'research' : 'general';
-    const priorThread = continuationOf ? this.getTask(continuationOf)?.threadId ?? null : null;
-    this.db.prepare(`INSERT INTO gateway_tasks(id,source_message_key,request_text,intent,status,source_item_id,continuation_of,project_alias,thread_id,created_at,updated_at)
-      VALUES(?,?,?,?, ?,?,?,?,?,?,?)`).run(id, sourceKey, requestText, intent, scopedProjectAlias ? 'waiting_approval' : 'queued', sourceItemId, continuationOf ?? null, scopedProjectAlias ?? null, priorThread, at, at);
+    const priorThread = conversationTask ? this.getTask(conversationTask)?.threadId ?? null : null;
+    this.db.prepare(`INSERT INTO gateway_tasks(id,source_message_key,request_text,intent,status,source_item_id,continuation_of,project_alias,thread_id,created_at,updated_at,transport)
+      VALUES(?,?,?,?, ?,?,?,?,?,?,?,?)`).run(id, sourceKey, requestText, intent, scopedProjectAlias ? 'waiting_approval' : 'queued', sourceItemId, conversationTask ?? null, scopedProjectAlias ?? null, priorThread, at, at, this.activeTransport);
     if (scopedProjectAlias) {
       this.db.prepare('INSERT INTO gateway_task_events(task_id,event_kind,content,created_at) VALUES(?,?,?,?)').run(id, 'approval_required', 'Project access requires explicit approval for this task.', at);
     } else {
-      this.db.prepare('INSERT INTO gateway_task_events(task_id,event_kind,content,created_at) VALUES(?,?,?,?)').run(id, 'queued', 'Accepted from the configured WhatsApp self-chat.', at);
+      this.db.prepare('INSERT INTO gateway_task_events(task_id,event_kind,content,created_at) VALUES(?,?,?,?)').run(id, 'queued', 'Accepted from the configured private gateway chat.', at);
     }
     return id;
   }
@@ -469,12 +501,11 @@ export class KnowledgeLibrary {
     }
   }
 
-  private findContinuationTarget(text: string, at: string): string | undefined {
-    if (!/^(?:compare|continue|follow[ -]?up|now|also|what about|how does|relate|expand)\b|\b(previous research|earlier research|that report|those findings|same topic)\b/i.test(text.trim())) return undefined;
+  private findDefaultConversationTask(at: string): string | undefined {
     const cutoff = new Date(Date.parse(at) - 24 * 60 * 60 * 1000).toISOString();
-    const candidates = this.db.prepare(`SELECT id FROM gateway_tasks WHERE status='completed' AND thread_id IS NOT NULL AND completed_at>=?
-      ORDER BY completed_at DESC LIMIT 2`).all(cutoff) as Array<{ id: string }>;
-    return candidates.length === 1 ? candidates[0]!.id : undefined;
+    const latest = this.db.prepare(`SELECT id FROM gateway_tasks WHERE status IN ('running','completed','needs_resume')
+      AND thread_id IS NOT NULL AND project_alias IS NULL AND updated_at>=? AND created_at<=? ORDER BY updated_at DESC LIMIT 1`).get(cutoff, at) as { id: string } | undefined;
+    return latest?.id;
   }
 
   private saveNote(sourceKey: string, content: string, at: string): string {
@@ -531,6 +562,7 @@ export class KnowledgeLibrary {
 
   private taskFromRow(row: Record<string, unknown>): GatewayTask {
     return { id: String(row.id), requestText: String(row.request_text), status: String(row.status) as GatewayTaskStatus,
+      transport: row.transport === 'telegram' ? 'telegram' : 'whatsapp',
       threadId: row.thread_id ? String(row.thread_id) : null, turnId: row.turn_id ? String(row.turn_id) : null, intent: String(row.intent), sourceMessageKey: String(row.source_message_key),
       createdAt: String(row.created_at), updatedAt: String(row.updated_at), result: row.result ? String(row.result) : null, error: row.error ? String(row.error) : null };
   }
@@ -595,51 +627,64 @@ export class KnowledgeLibrary {
   }
   isPaused(): boolean { return (this.db.prepare("SELECT value FROM settings WHERE key='gateway_paused'").get() as { value: string } | undefined)?.value === '1'; }
   setPaused(paused: boolean): void { this.db.prepare("INSERT INTO settings(key,value) VALUES('gateway_paused',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value").run(paused ? '1' : '0'); }
-  queueOutbox(taskId: string | null, body: string, at = new Date().toISOString(), deliveryKind?: 'local' | 'test' | 'auto'): string {
+  queueOutbox(taskId: string | null, body: string, at = new Date().toISOString(), deliveryKind?: 'local' | 'test' | 'auto', transport?: TransportKind): string {
     const id = randomUUID();
-    const enabled = (this.db.prepare("SELECT value FROM settings WHERE key='outbound_enabled'").get() as { value: string } | undefined)?.value === '1';
+    const deliveryTransport = transport ?? (taskId ? this.getTask(taskId)?.transport : undefined) ?? this.activeTransport;
+    const enabled = this.isOutboundEnabled(deliveryTransport);
     const kind = deliveryKind ?? (enabled ? 'auto' : 'local');
     const outgoingBody = kind === 'auto' && !/^(?:🤖\s*)?Codex:/i.test(body) ? `Codex: ${body}` : body;
     const bodyHash = createHash('sha256').update(outgoingBody).digest('base64url');
-    this.db.prepare("INSERT OR IGNORE INTO gateway_outbox(id,task_id,body,body_hash,delivery_state,created_at,delivery_kind) VALUES(?,?,?,?, 'local_pending',?,?)").run(id, taskId, outgoingBody.slice(0, 10000), bodyHash, at, kind);
+    this.db.prepare("INSERT OR IGNORE INTO gateway_outbox(id,task_id,body,body_hash,delivery_state,created_at,delivery_kind,delivery_transport) VALUES(?,?,?,?, 'local_pending',?,?,?)").run(id, taskId, outgoingBody.slice(0, 10000), bodyHash, at, kind, deliveryTransport);
     const row = this.db.prepare('SELECT id FROM gateway_outbox WHERE task_id IS ? AND body_hash=?').get(taskId, bodyHash) as { id: string };
     return row.id;
   }
-  getOutbox(limit = 50): unknown[] { return this.db.prepare('SELECT id,task_id AS taskId,body,delivery_state AS deliveryState,delivery_kind AS deliveryKind,created_at AS createdAt FROM gateway_outbox ORDER BY created_at DESC LIMIT ?').all(Math.min(200, limit)); }
-  createOutboundTest(): string {
-    return this.queueOutbox(null, 'Codex: WhatsApp to Codex gateway test. Outbound self-chat delivery is active.', new Date().toISOString(), 'test');
+  private isOutboundEnabled(transport: TransportKind): boolean {
+    const key = transport === 'telegram' ? 'outbound_enabled_telegram' : 'outbound_enabled';
+    return (this.db.prepare('SELECT value FROM settings WHERE key=?').get(key) as { value: string } | undefined)?.value === '1';
   }
-  claimOutbound(id: string, chatTitle: string): { id: string; body: string } | null {
-    if (chatTitle !== SELF_CHAT_TITLE) throw new Error('Self-chat title did not match the configured title.');
+  getOutbox(limit = 50): unknown[] { return this.db.prepare('SELECT id,task_id AS taskId,body,delivery_state AS deliveryState,delivery_kind AS deliveryKind,delivery_transport AS transport,created_at AS createdAt FROM gateway_outbox ORDER BY created_at DESC LIMIT ?').all(Math.min(200, limit)); }
+  createOutboundTest(transport: TransportKind = ACTIVE_TRANSPORT): string {
+    return this.queueOutbox(null, `Codex: ${transport === 'telegram' ? 'Telegram bot' : 'WhatsApp'} gateway test. Outbound replies are active.`, new Date().toISOString(), 'test', transport);
+  }
+  claimOutbound(id: string, chatTitle: string, transport: TransportKind = 'whatsapp'): { id: string; body: string } | null {
+    const expectedChatTitle = transport === 'telegram' ? TELEGRAM_CHAT_TITLE : SELF_CHAT_TITLE;
+    if (chatTitle !== expectedChatTitle) throw new Error('Private input chat did not match the configured transport.');
     return this.db.transaction(() => {
-      const enabled = (this.db.prepare("SELECT value FROM settings WHERE key='outbound_enabled'").get() as { value: string } | undefined)?.value === '1';
+      const enabled = this.isOutboundEnabled(transport);
       const row = this.db.prepare(`SELECT id,body FROM gateway_outbox WHERE id=? AND delivery_state='local_pending'
-        AND (delivery_kind='test' OR (delivery_kind='auto' AND ?=1))`).get(id, enabled ? 1 : 0) as { id: string; body: string } | undefined;
+        AND delivery_transport=? AND (delivery_kind='test' OR (delivery_kind='auto' AND ?=1))`).get(id, transport, enabled ? 1 : 0) as { id: string; body: string } | undefined;
       if (!row) return null;
-      const last = (this.db.prepare("SELECT value FROM settings WHERE key='outbound_last_attempt_at'").get() as { value: string } | undefined)?.value;
+      const attemptSetting = transport === 'telegram' ? 'outbound_last_attempt_at_telegram' : 'outbound_last_attempt_at';
+      const last = (this.db.prepare('SELECT value FROM settings WHERE key=?').get(attemptSetting) as { value: string } | undefined)?.value;
       if (last && Date.now() - Date.parse(last) < 60_000) return null;
       const changed = this.db.prepare("UPDATE gateway_outbox SET delivery_state='sending' WHERE id=? AND delivery_state='local_pending'").run(id);
       if (changed.changes !== 1) return null;
-      this.db.prepare("INSERT INTO settings(key,value) VALUES('outbound_last_attempt_at',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value").run(new Date().toISOString());
+      this.db.prepare('INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value').run(attemptSetting, new Date().toISOString());
       return row;
     })();
   }
-  claimNextOutbound(chatTitle: string): { id: string; body: string } | null {
-    if (chatTitle !== SELF_CHAT_TITLE) throw new Error('Self-chat title did not match the configured title.');
-    const enabled = (this.db.prepare("SELECT value FROM settings WHERE key='outbound_enabled'").get() as { value: string } | undefined)?.value === '1';
+  claimNextOutbound(chatTitle: string, transport: TransportKind = 'whatsapp'): { id: string; body: string } | null {
+    const expectedChatTitle = transport === 'telegram' ? TELEGRAM_CHAT_TITLE : SELF_CHAT_TITLE;
+    if (chatTitle !== expectedChatTitle) throw new Error('Private input chat did not match the configured transport.');
+    const enabled = this.isOutboundEnabled(transport);
     const row = this.db.prepare(`SELECT id FROM gateway_outbox WHERE delivery_state='local_pending'
-      AND (delivery_kind='test' OR (delivery_kind='auto' AND ?=1)) ORDER BY CASE delivery_kind WHEN 'test' THEN 0 ELSE 1 END,created_at LIMIT 1`).get(enabled ? 1 : 0) as { id: string } | undefined;
-    return row ? this.claimOutbound(row.id, chatTitle) : null;
+      AND delivery_transport=? AND (delivery_kind='test' OR (delivery_kind='auto' AND ?=1))
+      ORDER BY CASE delivery_kind WHEN 'test' THEN 0 ELSE 1 END,created_at LIMIT 1`).get(transport, enabled ? 1 : 0) as { id: string } | undefined;
+    return row ? this.claimOutbound(row.id, chatTitle, transport) : null;
   }
   markOutboundSent(id: string, messageKey: string): void {
     if (!/^[A-Za-z0-9_-]{43}$/.test(messageKey)) throw new Error('Invalid outbound message key hash.');
     const at = new Date().toISOString();
-    const current = this.db.prepare('SELECT delivery_state AS deliveryState,sent_message_key AS sentMessageKey,delivery_kind AS deliveryKind FROM gateway_outbox WHERE id=?').get(id) as { deliveryState: string; sentMessageKey: string | null; deliveryKind: string } | undefined;
+    const current = this.db.prepare('SELECT delivery_state AS deliveryState,sent_message_key AS sentMessageKey,delivery_kind AS deliveryKind,delivery_transport AS transport FROM gateway_outbox WHERE id=?').get(id) as { deliveryState: string; sentMessageKey: string | null; deliveryKind: string; transport: TransportKind } | undefined;
     if (current?.deliveryState === 'sent' && current.sentMessageKey === messageKey) return;
     const result = this.db.prepare("UPDATE gateway_outbox SET delivery_state='sent',sent_at=?,sent_message_key=? WHERE id=? AND delivery_state='sending'").run(at, messageKey, id);
     if (result.changes !== 1) throw new Error('Outbound message is not in sending state.');
-    this.db.prepare("INSERT INTO settings(key,value) VALUES('outbound_last_sent_at',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value").run(at);
-    if (current?.deliveryKind === 'test') this.db.prepare("INSERT INTO settings(key,value) VALUES('outbound_enabled','1') ON CONFLICT(key) DO UPDATE SET value='1'").run();
+    const sentSetting = current?.transport === 'telegram' ? 'outbound_last_sent_at_telegram' : 'outbound_last_sent_at';
+    this.db.prepare('INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value').run(sentSetting, at);
+    if (current?.deliveryKind === 'test') {
+      const key = current.transport === 'telegram' ? 'outbound_enabled_telegram' : 'outbound_enabled';
+      this.db.prepare('INSERT INTO settings(key,value) VALUES(?,\'1\') ON CONFLICT(key) DO UPDATE SET value=\'1\'').run(key);
+    }
   }
   markOutboundFailed(id: string): void {
     this.db.prepare("UPDATE gateway_outbox SET delivery_state='failed' WHERE id=? AND delivery_state='sending'").run(id);
@@ -807,7 +852,41 @@ export async function openLibrary(): Promise<KnowledgeLibrary> {
   await mkdir(DATA_DIR, { recursive: true, mode: 0o700 });
   await chmod(DATA_DIR, 0o700);
   await mkdir(dirname(DATABASE_PATH), { recursive: true, mode: 0o700 });
+  await backupBeforeTransportMigration(DATABASE_PATH);
   const library = new KnowledgeLibrary(DATABASE_PATH);
   await chmod(DATABASE_PATH, 0o600);
   return library;
+}
+
+async function backupBeforeTransportMigration(databasePath: string): Promise<void> {
+  try {
+    await access(databasePath);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return;
+    throw error;
+  }
+
+  let source: Database.Database;
+  try {
+    source = new Database(databasePath, { readonly: true, fileMustExist: true });
+  } catch {
+    throw new Error('Could not open the existing knowledge database to create a pre-migration backup.');
+  }
+
+  try {
+    const hasMigrations = source.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='schema_migrations'").get();
+    if (!hasMigrations) return;
+    const row = source.prepare('SELECT MAX(version) AS version FROM schema_migrations').get() as { version: number | null };
+    if ((row.version ?? 0) >= 5) return;
+
+    const backupDirectory = join(DATA_DIR, 'backups');
+    await mkdir(backupDirectory, { recursive: true, mode: 0o700 });
+    await chmod(backupDirectory, 0o700);
+    const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+    const backupPath = join(backupDirectory, `${basename(databasePath)}-before-telegram-v5-${stamp}-${randomUUID().slice(0, 8)}.sqlite`);
+    await source.backup(backupPath);
+    await chmod(backupPath, 0o600);
+  } finally {
+    source.close();
+  }
 }

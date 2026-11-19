@@ -26,7 +26,14 @@ try {
 await chmod(TOKEN_PATH, 0o600);
 const extensionConfig = fileURLToPath(new URL('../extension/config.js', import.meta.url));
 const extensionTitle = JSON.stringify(selfChatTitle);
-await writeFile(SETTINGS_PATH, `${JSON.stringify({ selfChatTitle }, null, 2)}\n`, { mode: 0o600 });
+let existingSettings: Record<string, unknown> = {};
+try {
+  const parsed: unknown = JSON.parse(await readFile(SETTINGS_PATH, 'utf8'));
+  if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) existingSettings = parsed as Record<string, unknown>;
+} catch {
+  // First setup.
+}
+await writeFile(SETTINGS_PATH, `${JSON.stringify({ ...existingSettings, selfChatTitle }, null, 2)}\n`, { mode: 0o600 });
 await chmod(SETTINGS_PATH, 0o600);
 await writeFile(extensionConfig, `globalThis.REEL_TO_CODEX_TOKEN = ${JSON.stringify(token)};\nglobalThis.REEL_TO_CODEX_SELF_CHAT_TITLE = ${extensionTitle};\n`, { mode: 0o600 });
 await chmod(extensionConfig, 0o600);
