@@ -6,12 +6,76 @@
   let blockedByGap = false;
   let lastStatus = '';
   let lastHeartbeat = 0;
+  let lastSelfChatSelectionAttempt = 0;
+  let selfChatSelectedThisPage = false;
+  let selfChatSearchOpened = false;
   let baselineCandidate;
   let baselineStablePolls = 0;
   const emptySince = new Map();
 
   function currentTitle() {
     return document.querySelector(HEADER)?.textContent?.trim() || '';
+  }
+
+  function selectConfiguredSelfChatOnStartup() {
+    if (selfChatSelectedThisPage || Date.now() - lastSelfChatSelectionAttempt < 5000) return false;
+    lastSelfChatSelectionAttempt = Date.now();
+    const pane = document.querySelector('#pane-side');
+    if (!pane) return false;
+
+    const quotedTitle = SELF_CHAT_TITLE
+      .replaceAll('\\', '\\\\')
+      .replaceAll('"', '\\"')
+      .replaceAll('\n', '\\a ')
+      .replaceAll('\r', '\\d ');
+    const exactMatches = [...pane.querySelectorAll(`[title="${quotedTitle}"], [data-testid="cell-frame-title"]`)]
+      .filter((element) => {
+        const exactTitle = element.getAttribute('title') === SELF_CHAT_TITLE || element.textContent?.trim() === SELF_CHAT_TITLE;
+        return exactTitle && element.getClientRects().length > 0;
+      });
+    const rows = new Set(exactMatches.map((element) =>
+      element.closest('[data-testid="cell-frame-container"], [role="listitem"]') || element));
+    if (rows.size === 1) {
+      const selfChatRow = [...rows][0];
+      if (!(selfChatRow instanceof HTMLElement)) return false;
+      selfChatRow.click();
+      return true;
+    }
+    if (rows.size > 1) return false;
+
+    const searchField = pane.querySelector('input[placeholder*="search" i], input[aria-label*="search" i], [contenteditable="true"][role="textbox"][aria-label*="search" i], [contenteditable="true"][aria-label*="search" i]');
+    if (searchField instanceof HTMLInputElement || searchField instanceof HTMLTextAreaElement) {
+      if (searchField.value.trim() && searchField.value.trim() !== SELF_CHAT_TITLE) return false;
+      if (!searchField.value.trim()) {
+        const valueSetter = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(searchField), 'value')?.set;
+        if (valueSetter) valueSetter.call(searchField, SELF_CHAT_TITLE);
+        else searchField.value = SELF_CHAT_TITLE;
+        searchField.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: SELF_CHAT_TITLE }));
+        return true;
+      }
+      return false;
+    }
+    if (searchField instanceof HTMLElement && searchField.isContentEditable) {
+      const value = searchField.textContent?.trim() || '';
+      if (value && value !== SELF_CHAT_TITLE) return false;
+      if (!value) {
+        searchField.focus();
+        document.execCommand('insertText', false, SELF_CHAT_TITLE);
+        searchField.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: SELF_CHAT_TITLE }));
+        return true;
+      }
+      return false;
+    }
+
+    if (!selfChatSearchOpened) {
+      const searchButton = pane.querySelector('button[aria-label*="Search"], [role="button"][aria-label*="Search"]');
+      if (searchButton instanceof HTMLElement) {
+        selfChatSearchOpened = true;
+        searchButton.click();
+        return true;
+      }
+    }
+    return false;
   }
 
   function notifyStatus(status) {
@@ -144,9 +208,14 @@
     if (busy) return;
     busy = true;
     try {
-      // This title check must pass before message nodes or text are queried.
-      if (currentTitle() !== SELF_CHAT_TITLE) {
-        notifyStatus('Open your Message Yourself chat to collect.');
+      // Select the configured self-chat once when this page starts. Never query
+      // message nodes or text until its exact header is visible.
+      if (!document.querySelector('#pane-side')) selfChatSelectedThisPage = false;
+      const visibleTitle = currentTitle();
+      if (visibleTitle === SELF_CHAT_TITLE) selfChatSelectedThisPage = true;
+      else {
+        const selected = selectConfiguredSelfChatOnStartup();
+        notifyStatus(selected ? 'Opening your configured Message Yourself chat…' : 'Waiting for the configured Message Yourself chat.');
         return;
       }
       notifyStatus('Self-chat active. Checking new messages…');

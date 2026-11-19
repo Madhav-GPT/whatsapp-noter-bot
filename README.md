@@ -23,7 +23,7 @@ npm run setup -- --self-chat-title "Your Name (You)"
 
 Replace the example with the exact self-chat title shown in WhatsApp Web. Setup writes that value, a random collector token, and the ignored `extension/config.js` under `~/Library/Application Support/ReelToCodex`. These are owner-only local files and are excluded from Git.
 
-Load or reload this project's `extension` folder from `chrome://extensions` with Developer mode enabled. Keep WhatsApp Web open and select the configured Message Yourself chat. The extension takes a baseline first; it does not import old messages.
+Load or reload this project's `extension` folder from `chrome://extensions` with Developer mode enabled. At page startup, the extension opens the configured Message Yourself chat by its exact title (using WhatsApp's sidebar search if needed). It reads message nodes only after that exact chat is selected. The extension takes a baseline first; it does not import old messages.
 
 Install automatic startup for your Mac user:
 
@@ -32,7 +32,7 @@ npm run gateway:startup -- install
 npm run gateway:startup -- status
 ```
 
-This installs two per-user macOS LaunchAgents: one starts the gateway when you log in and restarts it if it exits unexpectedly; the other opens WhatsApp Web in Chrome at login. The gateway and collector run in the background and write logs under `~/Library/Logs/ReelToCodex`. The WhatsApp page still needs an active login and the exact configured self-chat selected. If WhatsApp does not restore that chat, select it once in Chrome. Collection remains paused on other chats.
+This installs two per-user macOS LaunchAgents: one starts the gateway when you log in and restarts it if it exits unexpectedly; the other opens WhatsApp Web in Chrome at login. The gateway and collector run in the background and write logs under `~/Library/Logs/ReelToCodex`. WhatsApp Web still needs an active login. Once signed in, the extension selects the configured self-chat automatically. If WhatsApp asks you to sign in or its interface prevents the exact chat from being found, collection waits safely until that is resolved. Collection remains paused on other chats.
 
 Sign in to the gateway's isolated Codex home when needed. For a manual foreground run, start the service with:
 
@@ -138,7 +138,7 @@ The schema upgrades transactionally and keeps existing Reel, instruction, and fi
 
 ## Limits and privacy
 
-- The gateway starts at macOS user login and restarts after unexpected exits. It cannot work while the Mac is asleep, shut down, or logged out. Chrome must also remain open, WhatsApp Web must be logged in, and the exact self-chat must be selected. Automatic startup opens WhatsApp Web in Chrome at login, but if WhatsApp restores another chat or shows sign-in, collection waits for you to select the self-chat or sign in. Selecting another chat pauses observation before message nodes are queried and blocks outbound sends.
+- The gateway starts at macOS user login and restarts after unexpected exits. It cannot work while the Mac is asleep, shut down, or logged out. Chrome must also remain open and WhatsApp Web must be logged in. Automatic startup opens WhatsApp Web in Chrome at login; the extension selects the configured self-chat once per page start and reads messages only after confirming its exact title. Selecting another chat pauses observation before message nodes are queried and blocks outbound sends.
 - If the Mac sleeps, the gateway and Chrome stop polling. After wake, collection continues only when the browser is open, WhatsApp Web is logged in, and the exact self-chat is selected. If the last visible cursor has disappeared, collection stays paused until you review the chat and choose Rebaseline.
 - Earlier chat history is not imported. If the visible cursor disappears, collection pauses until rebaseline.
 - Website, Reel, and repository content are untrusted input. The gateway wraps source text as untrusted and never treats it as trusted system instructions.
